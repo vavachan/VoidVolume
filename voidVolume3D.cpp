@@ -16,13 +16,10 @@
 
 using namespace std;
 long double boxx,boxy,boxz;
-int PBCx=1;
-int PBCy=1;
-int PBCz=1;
+int PBCx=0;
+int PBCy=0;
+int PBCz=0;
 long double r_cut=0.0;
-
-long double DMIN=1e-10;
-long double epsilon=0.00000000000;
 
 long double convex_vol=0.;
 int nAtoms=0;
@@ -1710,8 +1707,8 @@ bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 				vect v3 = vectDiff(&a3->p,&a2->p);
 				vect v4 = vectDiff(&a4->p,&a2->p);
 				vect V = vectDiff(v->p,&a2->p);
-				cross=cross_product(&v2,&v3);
-				overlap1=innerProduct(&cross,&v4);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
+				cross=cross_product(&v3,&v4);
+				overlap1=innerProduct(&cross,&v2);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
 				overlap2=innerProduct(&cross,&V);//cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
 				if(overlap1<0.)
 					sign1=1;
@@ -1943,10 +1940,9 @@ int main( int argc, char * argv[] )
 		{
 			if(D->hull and D->v->is_void)
 			{
-				std::cout<<D->neighDel.size()<<"\n";
-
 				if(!inside_delunay(D->v,D,Atoms,nAtoms))
 				{
+					//std::cout<<D->v->p->x<<"\t"<<D->v->p->y<<"\t"<<D->v->p->z<<"\n";
 					//std::cout<<"here\n";
 					for(auto neigh:D->neighDel)
 					{
