@@ -229,8 +229,6 @@ struct atom
 	std::vector<int> contiguous;
 	//std::unordered_map<int,int> conti_index;
 	std::unordered_map<std::pair<int, int>, int, pair_hash> part_c;
-	std::unordered_map<std::pair<int, int>, int, pair_hash> bond_c;
-	std::unordered_map<std::pair<int, int>, int, pair_hash> D3bondinvoid;
 	std::unordered_map<int,int> edge_index;
 	std::unordered_map<std::pair<int, int>, vect ,pair_hash> MIDP;
 	std::unordered_map<int,vect> RMID;
@@ -1115,10 +1113,10 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 	{
 		std::cout<<std::setprecision(16);
 	}
-	//for(int j=0; j<nAtoms; j++)
-	for(auto atom : incompleteAtoms)
+	for(int j=0; j<nAtoms; j++)
+	//for(auto atom : incompleteAtoms)
 	{
-		int L =atom;
+		int L =j;
 		if(L==K || L ==I || L==J)
 			continue;
 		
@@ -1888,7 +1886,7 @@ int main( int argc, char * argv[] )
 		{
 			first_delunay(&(Atoms[iAtom]),Atoms);
 		}
-		else
+		if(Atoms[iAtom].delunayTetrahedrons.size())
 			completeDelunayTessellation(&(Atoms[iAtom]),Atoms,nAtoms);
 		for(int neighborAtom:Atoms[iAtom].contiguous)
 		{
