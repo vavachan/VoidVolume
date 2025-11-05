@@ -24,6 +24,8 @@ long double r_cut=0.0;
 long double convex_vol=0.;
 int nAtoms=0;
 std::vector<int> incompleteAtoms;
+std::deque<int> atomsToAnalyze;
+std::unordered_set<int> processedOrQueuedAtoms;
 
 
 std::ofstream outputFile("delaunay_edges.txt");
@@ -1113,10 +1115,10 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 	{
 		std::cout<<std::setprecision(16);
 	}
-	for(int j=0; j<nAtoms; j++)
+	for(int atom=0; atom<nAtoms; atom++)
 	//for(auto atom : incompleteAtoms)
 	{
-		int L =j;
+		int L =atom;
 		if(L==K || L ==I || L==J)
 			continue;
 		
@@ -1139,66 +1141,66 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 			sign_N=-1;
 		if(sign!=sign_N) // The atom J lies on the +ve z axis 
 		{
-			int faces[4][3]; 
-			faces[0][0]=L;
-			faces[0][1]=I;
-			faces[0][2]=J;
+			//int faces[4][3]; 
+			//faces[0][0]=L;
+			//faces[0][1]=I;
+			//faces[0][2]=J;
 
-			faces[1][0]=L;
-			faces[1][1]=I;
-			faces[1][2]=ATOM->index;
+			//faces[1][0]=L;
+			//faces[1][1]=I;
+			//faces[1][2]=ATOM->index;
 
-			faces[2][0]=L;
-			faces[2][1]=J;
-			faces[2][2]=ATOM->index;
+			//faces[2][0]=L;
+			//faces[2][1]=J;
+			//faces[2][2]=ATOM->index;
 
 
-			faces[3][0]=I;
-			faces[3][1]=J;
-			faces[3][2]=ATOM->index;
+			//faces[3][0]=I;
+			//faces[3][1]=J;
+			//faces[3][2]=ATOM->index;
 
-			bool someFaceHasTwoD=false;
-			for(int face=0; face<4; face++)
-			{
-				int triplet[3];
-				triplet[0]=faces[face][0];
-				triplet[1]=faces[face][1];
-				triplet[2]=faces[face][2];
-				for(int k=0; k<3; k++)
-				{
-					int a1=triplet[k];
-					int a2=triplet[(k+1)%3];
-					int a3=triplet[(k+2)%3];
-					if(a2>a3)
-					{
-						if(Atoms[a1].part_c.find({a2,a3})!=Atoms[a1].part_c.end()) 
-							if(Atoms[a1].get_part_c(a2,a3)==2)
-							{
-								someFaceHasTwoD=true;
-								break;
-							}
-							
-					}
-					else
-						if(Atoms[a1].part_c.find({a3,a2})!=Atoms[a1].part_c.end()) 
-							if(Atoms[a1].get_part_c(a3,a2)==2)
-							{
-								someFaceHasTwoD=true;
-								break;
-							}
-				}
-				if(someFaceHasTwoD)
-					break;
-			}
-			if(someFaceHasTwoD)
-				continue;
-			long double DISI=sqrtl(magnitudeSq(&vI));
-			long double DISJ=sqrtl(magnitudeSq(&vJ));
-			long double DISL=sqrtl(magnitudeSq(&vL));
+			//bool someFaceHasTwoD=false;
+			//for(int face=0; face<4; face++)
+			//{
+			//	int triplet[3];
+			//	triplet[0]=faces[face][0];
+			//	triplet[1]=faces[face][1];
+			//	triplet[2]=faces[face][2];
+			//	for(int k=0; k<3; k++)
+			//	{
+			//		int a1=triplet[k];
+			//		int a2=triplet[(k+1)%3];
+			//		int a3=triplet[(k+2)%3];
+			//		if(a2>a3)
+			//		{
+			//			if(Atoms[a1].part_c.find({a2,a3})!=Atoms[a1].part_c.end()) 
+			//				if(Atoms[a1].get_part_c(a2,a3)==2)
+			//				{
+			//					someFaceHasTwoD=true;
+			//					break;
+			//				}
+			//				
+			//		}
+			//		else
+			//			if(Atoms[a1].part_c.find({a3,a2})!=Atoms[a1].part_c.end()) 
+			//				if(Atoms[a1].get_part_c(a3,a2)==2)
+			//				{
+			//					someFaceHasTwoD=true;
+			//					break;
+			//				}
+			//	}
+			//	if(someFaceHasTwoD)
+			//		break;
+			//}
+			//if(someFaceHasTwoD)
+			//	continue;
+			long double DISIsq=magnitudeSq(&vI);
+			long double DISJsq=magnitudeSq(&vJ);
+			long double DISLsq=magnitudeSq(&vL);
 			long double B[3],A[3][3];
-			B[0]=(DISI*DISI+rS*rS-rI*rI)/2.;
-			B[1]=(DISJ*DISJ+rS*rS-rJ*rJ)/2.;
-			B[2]=(DISL*DISL+rS*rS-rL*rL)/2.;
+			B[0]=(DISIsq+rS*rS-rI*rI)/2.;
+			B[1]=(DISJsq+rS*rS-rJ*rJ)/2.;
+			B[2]=(DISLsq+rS*rS-rL*rL)/2.;
 			A[0][0]=vI.x;
 			A[0][1]=vI.y;
 			A[0][2]=vI.z;
@@ -1296,6 +1298,21 @@ void convexHull(delunay* D, atom* ATOM, atom Atoms[], int I, int J, int K)
 		Aj->increment_part_c(ATOM->index,Ai->index);
 	else
 		Aj->increment_part_c(Ai->index,ATOM->index);
+	if(!ATOM->checkIfIncompleteFace())
+	{
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), ATOM->index), incompleteAtoms.end());
+	}
+	if(!Ai->checkIfIncompleteFace())
+	{
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), Ai->index), incompleteAtoms.end());
+	}
+	if(!Aj->checkIfIncompleteFace())
+	{
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), Aj->index), incompleteAtoms.end());
+	}
 	//ATOM->bond_c[{I,J}]=1;
 	//ATOM->bond_c[{J,I}]=1;
 
@@ -1394,6 +1411,11 @@ void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 					sign=-1;
 				delunay *D_TWO = nullptr;
 				D_TWO=constr_del(ATOM,Atoms,vI,vJ,sign,I,J,K,rI,rJ,D_TWO);
+				if(D_TWO)
+				{
+					print_delunay(outputFile,D_TWO,Atoms);
+					outputFile<<std::flush;
+				}
 				if(!D_TWO)
 				{
 					/* part of convex hull */
@@ -1864,12 +1886,10 @@ int main( int argc, char * argv[] )
 	//check_configuration(Atoms,nAtoms);//,6e-1/SIGMA);
 
 	//std::vector<int> atomsToAnalyze={0};
-	std::deque<int> atomsToAnalyze;
 
 	// 2. A "has-been-seen" list. std::unordered_set provides very fast
 	//    checking to see if an atom has already been added. This is the key
 	//    to ensuring uniqueness and preventing infinite loops.
-	std::unordered_set<int> processedOrQueuedAtoms;
 	atomsToAnalyze.push_back(0);
 	processedOrQueuedAtoms.insert(0);
 	//for(int i=0; i< nAtoms; i++)
@@ -1888,6 +1908,7 @@ int main( int argc, char * argv[] )
 		}
 		if(Atoms[iAtom].delunayTetrahedrons.size())
 			completeDelunayTessellation(&(Atoms[iAtom]),Atoms,nAtoms);
+		//std::cout<<iAtom<<"\t"<<Atoms[iAtom].contiguous.size()<<"\n";
 		for(int neighborAtom:Atoms[iAtom].contiguous)
 		{
 			if (processedOrQueuedAtoms.count(neighborAtom) == 0) {
