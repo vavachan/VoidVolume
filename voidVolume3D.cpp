@@ -1,3 +1,35 @@
+/*
+ * ============================================================================
+ *  voidVolume3D -- exact void/free-volume analysis for sphere packings
+ * ============================================================================
+ *
+ *  Computes the exact geometric volume of the void (unoccupied) space in a
+ *  3-D packing of possibly-overlapping, possibly-polydisperse spheres, by
+ *  constructing the (weighted / radical) Delaunay tessellation of the sphere
+ *  centers and integrating the empty space within each Delaunay tetrahedron
+ *  that is not covered by any sphere.
+ *
+ *  Algorithm reference:
+ *    Sastry, S., Corti, D. S., Debenedetti, P. G., & Stillinger, F. H. (1997).
+ *    "Statistical geometry of particle packings. I. Algorithm for exact
+ *    determination of connectivity, volume, and surface areas of void space
+ *    in monodisperse and polydisperse sphere packings."
+ *    Physical Review E, 56(5), 5524.
+ *
+ *  Build:
+ *    g++ voidVolume3D.cpp -std=c++11 -O3 -o voidVolume3D
+ *    (or simply: make)
+ *
+ *  Usage:
+ *    ./voidVolume3D <input_file> <probe_radius> [output_dir] [sample_atom_index]
+ *
+ *  See README.md for a full description of the input file format, all
+ *  command-line arguments, every output file that is produced, and known
+ *  limitations (in particular the periodic-boundary-condition caveat about
+ *  particles tessellating with their own periodic image).
+ * ============================================================================
+ */
+
 #include<iostream>
 #include<math.h>
 #include<fstream>
@@ -11,47 +43,75 @@
 #include <algorithm>
 #include <deque>
 #include <unordered_set>
-
-
+#include <unordered_map>
+#include <array>
+#include <string>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 using namespace std;
-#define distance(x,y) x*x+y*y
-int dim=3;
-long double box=0;
-long double twob;
-long double boxx,boxy,boxz;
-long double density;
-long double r_cut=0.0;
-long double DMIN=1e-10;
-long double epsilon=0.00000000000;
-int void_vert_count=0;
-//int **contiguous;
-//int PBC=1;
-long double *radius;
-long double convex_vol=0.;
-int nAtoms=0;
-int PBCx=1;
-int PBCy=1;
-int PBCz=1;
-std::ofstream outputFile("delaunay_edges.txt");
+
+// ---------------------------------------------------------------------------
+// Global simulation state.
+//
+// The original implementation threads state (box geometry, periodicity
+// flags, running totals, and work queues for the breadth-first Delaunay
+// construction) through global variables rather than a context object or
+// class members. That architecture has been preserved here to avoid
+// touching the numerically delicate geometry routines below; the globals
+// are documented in one place instead of being scattered as implicit
+// parameters through dozens of function signatures.
+// ---------------------------------------------------------------------------
+long double boxx, boxy, boxz;        // Simulation box lengths (x, y, z).
+int PBCx = 1;                        // Periodic boundary conditions are
+int PBCy = 1;                        // applied along all three axes; see
+int PBCz = 1;                        // README.md for the PBC caveat.
+long double r_cut = 0.0;             // Probe radius, added to every particle
+				     // radius before the geometric analysis.
+
+long double convex_vol = 0.;         // Running sum of Delaunay tetrahedron
+				     // volumes (diagnostic: should equal
+				     // boxx*boxy*boxz for a valid PBC
+				     // tessellation).
+int nAtoms = 0;                      // Number of particles read from input.
+std::vector<int> incompleteAtoms;    // Particles whose local Delaunay
+				     // neighborhood is not yet fully closed.
+std::vector<int> allAtoms;           // Particles not yet visited by the
+				     // breadth-first traversal in main().
+std::deque<int> atomsToAnalyze;              // BFS work queue.
+std::unordered_set<int> processedOrQueuedAtoms;  // BFS "already seen" set.
+
+// Opened in main() once the output directory has been resolved from the
+// command line; receives a VMD Tcl script drawing every edge of every
+// Delaunay tetrahedron (useful for visually auditing the tessellation).
+std::ofstream outputFile;
+
 struct face;
 struct vertice;
 struct vect
 {
-	 long double x=0;
-	 long double y=0;
-	 long double z=0;
+	long double x=0;
+	long double y=0;
+	long double z=0;
 };
 //#include <unordered_map>
 
 struct pair_hash {
-    std::size_t operator()(const std::pair<int, int>& p) const {
-        return std::hash<int>()(p.first) ^ std::hash<int>()(p.second);
-    }
+	std::size_t operator()(const std::pair<int, int>& p) const {
+		return std::hash<int>()(p.first) ^ std::hash<int>()(p.second);
+	}
 };
- long double distancesq(vect p,vect q)
+struct faceHash{
+	std::size_t operator()(const std::array<int,3> p) const {
+		return (std::hash<int>()(p[0]) ^ std::hash<int>()(p[1]))^ std::hash<int>()(p[2]);
+	}
+};
+long double distancesq(vect p,vect q)
 {
-	 long double dist=0.;
+	long double dist=0.;
 	dist=(p.x-q.x)*(p.x-q.x)+(p.y-q.y)*(p.y-q.y)+(p.z-q.z)*(p.z-q.z);
 	return dist;
 }
@@ -75,7 +135,7 @@ vect vectDiff(vect *a, vect *b)
 	return dr;
 }
 
- long double innerProduct(vect* a, vect* b)
+long double innerProduct(vect* a, vect* b)
 {
 	return a->x*b->x+a->y*b->y+a->z*b->z;
 }
@@ -92,14 +152,6 @@ long double magnitudeSq(vect *v)
 {
 	return v->x*v->x+v->y*v->y+v->z*v->z;
 }
-void display_SITE(struct vect *p)
-{
-	std::cout<<"draw sphere\t{";
-	std::cout<<p->x<<"\t"<<p->y<<"\t"<<p->z<<"}\tradius\t"<<1e-6<<"\t"<<"resolution\t10\n";
-}
-//definition of half-edge
-//definition of vertice
-//definition of face
 struct face
 {
 	vect A1,A2,A3;
@@ -114,23 +166,76 @@ struct delunay
 	vect MIDP[4][4];
 	int EDGE[4][4];
 	int FACE[4][4][4];
-	int DEL=0;
+	std::unordered_map<std::array<int,3>, delunay*, faceHash> neighDel;
+	std::unordered_map<std::array<int,3>, bool, faceHash> isVoid;
+	int numNeighbors=0;
 	vertice *v=nullptr;
 	vect circumCenter;
-	 //long double circum_x=0.;
-	 //long double circum_y=0.;
-	 //long double circum_z=0.;
+	//long double circum_x=0.;
+	//long double circum_y=0.;
+	//long double circum_z=0.;
 	delunay *next=nullptr;
 	delunay *prev=nullptr;
 	int hull=0;
+	int clusterIndex=-1;
 	//int solid=0;
+
+	bool checkIfNeighbor(delunay *D)
+	{
+		for(auto nD:neighDel)
+		{
+			if(nD.second==D)
+				return true;
+		}
+		return false;
+	}
+	delunay* findNeighbor(std::array<int,3> face)
+	{
+		std::sort(face.begin(),face.end());
+		if(neighDel.find(face)!=neighDel.end())
+		{
+			return neighDel[face];
+		}
+		else
+		{
+			return nullptr;
+			//std::cerr<<"Face ["<<face[0]<<"\t"<<face[1]<<"\t"<<face[2]<<"] does not exist in tetrahedron ["<<AT[0]<<"\t"<<AT[1]<<"\t"<<AT[2]<<"\t"<<AT[3]<<"]\n";
+			//exit(EXIT_FAILURE);
+		}
+	}
+	void addNeighbor(delunay* D, std::array<int,3> face, bool bondInVoid)
+	{
+		std::sort(face.begin(),face.end());
+		if(!findNeighbor(face))
+		{
+			neighDel[face]=D;
+			isVoid[face]=bondInVoid;
+			numNeighbors++;
+		}
+		else
+		{
+			if(findNeighbor(face) != D)
+				std::cerr<<"error\n";
+		}
+	}
+	void delNeighbor(delunay* D)
+	{
+		std::vector<std::pair<std::array<int,3>, delunay*>> entries(neighDel.begin(), neighDel.end());
+		for(auto nD:entries)
+		{
+			if(nD.second==D)
+				neighDel.erase(nD.first);
+		}
+	}
 };
-struct container_delunay
+struct DelanuayTessellaton
 {
-	delunay *D=nullptr;
-	struct container_delunay *next=nullptr;
-	struct container_delunay *prev=nullptr;
-};
+	std::vector<delunay*> tetrahedrons;
+	void addTetrahedron(delunay* D) 
+	{
+		tetrahedrons.push_back(D);
+	}
+} fullSet;
 struct vertice
 {
 	struct vect *p=nullptr;
@@ -141,178 +246,15 @@ struct vertice
 	int vivectd=0;
 	delunay *D=nullptr;
 	int is_void=0;
-	int cluster_index=-1;
+	//int cluster_index=-1;
 	long double r;
 	long double ball_r=0.;
 	//vert_list *V;
 	vertice *neib_vert[10]= {nullptr};
 	int neib_ed[10];
 	int v_neigh_count=0;
-}*start,*s_temp,*vects;
-struct container_vertice
-{
-	struct vertice *V=nullptr;
-	struct container_vertice *next=nullptr;
-	struct container_vertice *prev=nullptr;
-}**CSTART,*VOID_START;
-int compare(struct vect *p1,struct vect *p2,int del=0)
-{
-	 long double DX,DY,DZ;
-	DX=p1->x-p2->x;
-	DY=p1->y-p2->y;
-	DZ=p1->z-p2->z;
-	if(!del)
-	{
-		DX=(DX-(boxx*PBCx*lroundl(DX/boxx)));
-		DY=(DY-(boxy*PBCy*lroundl(DY/boxy)));
-		DZ=(DZ-(boxz*PBCz*lroundl(DZ/boxz)));
-	}
-	if( abs(DX) <DMIN && abs(DX) >DMIN )
-	{
-		cout<<p1->x<<"\t"<<p1->y<<"\n";
-		cout<<p2->x<<"\t"<<p2->y<<"\n";
-	}
-	if( abs(DY) <DMIN  && abs(DX) <DMIN && abs(DZ) < DMIN )
-	{
-		return 0;
-	}
-	else if ( (p1->y == p2->y) && ( p1->x > p2->x ) )
-		return 1;
-	else if( p1->y > p2->y )
-		return 1;
-	else
-		return -1;
-}
-void add_connected(vertice *focus,vertice *add,int binv,int debug=0)
-{
-	int flag=1;
-	int i;
-	if(debug)
-	{
-		cout<<"begin\n";
-		cout<<focus<<"\n";
-		display_SITE(focus->p);
-		display_SITE(add->p);
-	}
-	for(i=0; i<focus->v_neigh_count; i++)
-	{
-		if(focus->neib_vert[i])
-		{
-			if(!compare(focus->neib_vert[i]->p,add->p))
-			{
-				//std::vector<int> EV1 {focus->neib_vert[i]->A,focus->neib_vert[i]->D->a,focus->neib_vert[i]->D->b,focus->neib_vert[i]->D->c};
-				//std::vector<int> v1 {add->A,add->D->a,add->D->b,add->D->c};
-				flag=0;
-				break;
-			}
-		}
-	}
-	if(flag)
-	{
-		if(debug)
-			cout<<"added\n";
-		focus->neib_vert[focus->v_neigh_count]=add;
-		focus->neib_ed[focus->v_neigh_count]=binv;
-		focus->v_neigh_count=focus->v_neigh_count+1;
-	}
-	else
-		focus->neib_ed[i]=binv;
-}
-class set_of_delunay
-{
-	public :
-		delunay *initial=nullptr;
-		delunay *end=nullptr;
-		void insert_delunay(delunay *d1);
-		void remove_delunay(delunay *d1);
-}FULLSETD;
-void set_of_delunay :: insert_delunay(delunay *d1)
-{
-	if(!initial)
-	{
-		initial=d1;
-		end=d1;
-	}
-	else
-	{
-		end->next=d1;
-		d1->prev=end;
-		end=end->next;
-	}
-}
-void set_of_delunay :: remove_delunay(delunay *d1)
-{
-	if(d1==initial)
-	{
-		initial=d1->next;
-		initial->prev=nullptr;
-	}
-	else if (d1==end)
-	{
-		end=d1->prev;
-		end->next=nullptr;
-	}
-	else
-	{
-		d1->next->prev=d1->prev;
-		d1->prev->next=d1->next;
-	}
-
-}
-class set_of_cvert
-{
-	public :
-		container_vertice *initial=nullptr;
-		container_vertice *end=nullptr;
-		void insert_cvert(container_vertice *d1);
-		void delete_cvert(container_vertice *d1);
 };
 
-void set_of_cvert:: insert_cvert(container_vertice *d1)
-{
-	if(!initial)
-	{
-		initial=d1;
-		end=d1;
-	}
-	else
-	{
-		end->next=d1;
-		end=end->next;
-	}
-}
-void set_of_cvert::delete_cvert(container_vertice *d1)
-{
-	container_vertice *temp;
-	temp=initial;
-	while(temp)
-	{
-		if(temp->V->D->AT[0]==d1->V->D->AT[0] && temp->V->D->AT[1]==d1->V->D->AT[1] && temp->V->D->AT[2]==d1->V->D->AT[2] && temp->V->D->AT[3]==d1->V->D->AT[3] )
-		{
-			if(temp==initial)
-			{
-				initial=temp->next;
-				delete temp;
-				return ;
-			}	
-			else if(temp==end)
-			{
-				end=temp->prev;
-				delete temp;
-				return ;
-			}
-			else
-			{
-				temp->prev->next=temp->next;
-				temp->next->prev=temp->prev;
-				delete temp;
-				return ;
-			}
-		}
-		temp->next;
-	}
-	cout<<"not found\n";
-}
 class convex_hull
 {
 	public : 
@@ -341,25 +283,18 @@ struct atom
 	std::vector<int> contiguous;
 	//std::unordered_map<int,int> conti_index;
 	std::unordered_map<std::pair<int, int>, int, pair_hash> part_c;
-	std::unordered_map<std::pair<int, int>, int, pair_hash> bond_c;
-	std::unordered_map<std::pair<int, int>, int, pair_hash> D3bondinvoid;
 	std::unordered_map<int,int> edge_index;
 	std::unordered_map<std::pair<int, int>, vect ,pair_hash> MIDP;
 	std::unordered_map<int,vect> RMID;
 	std::unordered_map<std::pair<int, int>, std::pair<delunay*,delunay*>,pair_hash> DelaunayTessellations;
 	int bor=0;
-	//vect MIDP[200][200];
-	//vect RMID[200];
+	std::vector<delunay*> delunayTetrahedrons;
+	int numFaces=0;
 	struct face *F=nullptr;
 	long double radius=1.;
 	int ignore=0;
 	int index;
 	long double vor_vol;
-	container_vertice *Cstart;
-	set_of_delunay *D;
-	set_of_cvert *S;
-	container_delunay *D_FIRST;
-	int type;
 
 	bool check_if_contiguous(int I)
 	{
@@ -405,298 +340,23 @@ struct atom
 			exit(EXIT_FAILURE);
 		}
 	}
-};
-class vert_list
-{
-	public:
-		vertice *initial=nullptr;
-		vertice *end=nullptr;
-		void delete_vertice(vertice *,int);
-		void insert_vertice(vertice *,int);
-		void display_vertex(vertice *);
-		//void display_conn(vertice *ve);
-}*V;
-void vert_list::insert_vertice(vertice *v,int debug=0)
-{
-	if(!initial)
+	bool checkIfIncompleteFace()
 	{
-		initial=v;
-		end=v;
-	}	
-	else
-	{
-		end->next=v;
-		v->prev=end;
-		end=v;
-	}
-}
-void vert_list::delete_vertice(vertice *v,int debug=0)
-{
-	if(v->next)
-	{
-		if(v->prev)
+		bool yes=false;
+		for (const auto& element : part_c) 
 		{
-			v->prev->next=v->next;
-			v->next->prev=v->prev;
-		}
-		else
-		{
-			initial=v->next;
-			v->next->prev=nullptr;
-		}
-	}	
-	else
-	{
-		end=v->prev;
-		v->prev->next=nullptr;
-	}
-	vertice *v_neib=nullptr;
-	for(int i=0;i<v->v_neigh_count;i++)
-	{
-		v_neib=v->neib_vert[i];	
-		int temp_index=0;
-		for(int j=0;j<v_neib->v_neigh_count;j++)
-		{
-			if(v_neib->neib_vert[j]==v)
+			if(element.second==1)
 			{
-				v_neib->neib_vert[j]=nullptr;
-			}	
-		}
-		for(int j=0;j<v_neib->v_neigh_count;j++)
-		{
-			if(v_neib->neib_vert[j]==nullptr)
-			{
-				if(v_neib->neib_vert[j+1])
-				{
-					v_neib->neib_vert[j]=v_neib->neib_vert[j+1];
-					v_neib->neib_ed[j]=v_neib->neib_ed[j+1];
-					v_neib->neib_vert[j+1]=nullptr;
-				}
+				yes=true;
+				break;
 			}
 		}
-		v_neib->v_neigh_count=v_neib->v_neigh_count-1;
-	}	
-	//delete v->p;
-	delete v;
-}
-void vert_list::display_vertex(vertice *start)
-{
-	display_SITE(start->p);
-	if(start->next)
-		display_vertex(start->next);
-	else
-		return;
-	;
-}
-//void vert_list::display_conn(vertice *ve)
-//{
-//	if(ve->v_neigh_count==2)
-//	{
-//		cout<<"#"<<ve->v_neigh_count<<"\n";
-//		for(int i=0; i<ve->v_neigh_count; i++)
-//		{
-//			 long double Sx,Sy;
-//			Sx=ve->neib_vert[i]->p->x-ve->p->x;
-//			Sy=ve->neib_vert[i]->p->y-ve->p->y;
-//			Sx=(Sx-(boxx*PBC*lroundl(Sx/boxx)));
-//			Sy=(Sy-(twob*PBC*lroundl(Sy/twob)));
-//			cout<<ve->p->x<<"\t"<<ve->p->y<<"\t"<<Sx+ve->p->x<<"\t"<<Sy+ve->p->y<<"\n";
-//		}
-//	}
-//	if(ve->next)
-//		display_conn(ve->next);
-//	else
-//		return;
-//
-//}
-//void update_neighbours(atom Atoms[],int nAtoms,long double R_CUT)
-//{
-//	for(int i=0; i<nAtoms-1; i++)
-//	{
-//		for(int j=i+1; j<nAtoms; j++)
-//		{
-//			vect rImJ = vectDiff(&Atoms[i].p,&Atoms[j].p);
-//			long double dr= magnitudeSq(&rImJ);
-//			if(dr<R_CUT*R_CUT)
-//			{
-//				Atoms[i].neighlist.push_back(j);
-//				Atoms[j].neighlist.push_back(i);
-//				//Atoms[i].neighlist[Atoms[i].neighbours]=j;
-//				//Atoms[j].neighlist[Atoms[j].neighbours]=i;
-//				//Atoms[i].neighbours++;
-//				//Atoms[j].neighbours++;
-//			}
-//		}
-//	}
-//	//for(int i=0;i<nAtoms;i++)
-//	//{
-//	//	std::cout<<i<<"\t"<<Atoms[i].neighlist.size()<<"\n";
-//	//}
-//}
-void check_configuration(atom Atoms[],int nAtoms)
-{
-	for(int i=0; i<nAtoms-1; i++)
-	{
-		for(int j=i+1; j<nAtoms; j++)
-		{
-			vect rImJ = vectDiff(&Atoms[i].p,&Atoms[j].p);
-			long double dr= magnitudeSq(&rImJ);
-			//if(Atoms[i].radius+Atoms[j].radius > sqrt(dr))
-			//{
-			//	std::cout<<"overlap"<<"\t"<<dr<<"\t"<<i<<"\t"<<j<<"\n";
-			//}
-			//if(Atoms[i].radius>Atoms[j].radius)
-			//{
-			//	if(sqrt(dr)<Atoms[i].radius-Atoms[j].radius)
-			//	{
-			//		std::cerr << "sphere inside another\n"; 
-			//		exit(EXIT_FAILURE);
-			//	}
-			//}
-			//else
-			//{
-			//	if(sqrt(dr)<Atoms[j].radius-Atoms[i].radius)
-			//	{
-			//		std::cerr << "sphere inside another\n"; 
-			//		exit(EXIT_FAILURE);
-			//	}
-			//}
-		}
+		return yes;
 	}
-	//for(int i=0;i<nAtoms;i++)
-	//{
-	//	std::cout<<i<<"\t"<<Atoms[i].neighlist.size()<<"\n";
-	//}
-}
-void print_face(face *f,int trans=0)
-{
-	////if(trans)
-	////{
-	////	cout<<"mol new\n";
-	////	cout<<"draw material Transparent\n";
-	////}
-	////else
-	////{
-	////	cout<<"mol new\n";
-	////	cout<<"draw material Opaque\n";
-	////}
-	cout<<"draw color blue\n";
-	cout<<"draw triangle \t{";
-	cout<<f->A1.x<<"\t"<<f->A1.y<<"\t"<<f->A1.z<<"}\t{";
-	cout<<f->A2.x<<"\t"<<f->A2.y<<"\t"<<f->A2.z<<"}\t{";
-	cout<<f->A3.x<<"\t"<<f->A3.y<<"\t"<<f->A3.z<<"}\n";
-	cout<<"draw color black\n";
-	cout<<"draw line\t{";
-	cout<<f->A1.x<<"\t"<<f->A1.y<<"\t"<<f->A1.z<<"}\t{";
-	cout<<f->A2.x<<"\t"<<f->A2.y<<"\t"<<f->A2.z<<"}\n";
-	cout<<"draw line\t{";
-	cout<<f->A1.x<<"\t"<<f->A1.y<<"\t"<<f->A1.z<<"}\t{";
-	cout<<f->A3.x<<"\t"<<f->A3.y<<"\t"<<f->A3.z<<"}\n";
-	cout<<"draw line\t{";
-	cout<<f->A2.x<<"\t"<<f->A2.y<<"\t"<<f->A2.z<<"}\t{";
-	cout<<f->A3.x<<"\t"<<f->A3.y<<"\t"<<f->A3.z<<"}\n";
-}
-void print_delunay_solid(delunay *D,atom Atoms[],int TYPE)
-{
-	cout<<"##\t"<<D->AT[0]<<"\t"<<D->AT[1]<<"\t"<<D->AT[2]<<"\t"<<D->AT[3]<<"\n";
-	////cout<<"mol new\n";
-	////cout<<"draw material Opaque\n";
-	//if(D->FACE[0][1][2])
-	{
-		cout<<"draw color blue\n";
-		// }
-		// else
-		// 	cout<<"draw color green\n";
-		// {
-		cout<<"draw triangle\t{";
-		cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-		cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\t{";
-		cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\n";
-}
-// if(D->FACE[0][1][3])
-{
-	cout<<"draw color blue\n";
-	// }
-	// else
-	// 	cout<<"draw color green\n";
-	// {
-	cout<<"draw triangle\t{";
-	cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-	}
-// if(D->FACE[1][2][3])
-{
-	cout<<"draw color blue\n";
-	// }
-	// else
-	// 	cout<<"draw color green\n";
-	// {
-	cout<<"draw triangle\t{";
-	cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-	}
-//  if(D->FACE[0][2][3])
-{
-	cout<<"draw color blue\n";
-	// }
-	// else
-	// 	cout<<"draw color green\n";
-	// {
-	cout<<"draw triangle\t{";
-	cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\t{";
-	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-	}
-////if(D->EDGE[0][1])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\n";
-////}
-////if(D->EDGE[0][2])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\n";
-////}
-////if(D->EDGE[0][3])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-////}
-////if(D->EDGE[1][2])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\n";
-////}
-////if(D->EDGE[1][3])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-////}
-////if(D->EDGE[2][3])
-////{
-////	cout<<"draw line\t{";
-////	cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\t{";
-////	cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\n";
-////}
-//cout<<"mol new\n";
-//cout<<"draw material Transparent\n";
-//cout<<"draw color red\n";
-//cout<<"draw sphere\t{";
-//cout<<Atoms[D->AT[0]].p.x<<"\t"<<Atoms[D->AT[0]].p.y<<"\t"<<Atoms[D->AT[0]].p.z<<"}\tradius\t"<<Atoms[D->AT[0]].radius<<"\tresolution 10\n";
-//cout<<"draw sphere\t{";
-//cout<<Atoms[D->AT[1]].p.x<<"\t"<<Atoms[D->AT[1]].p.y<<"\t"<<Atoms[D->AT[1]].p.z<<"}\tradius\t"<<Atoms[D->AT[1]].radius<<"\tresolution 10\n";
-//cout<<"draw sphere\t{";
-//cout<<Atoms[D->AT[2]].p.x<<"\t"<<Atoms[D->AT[2]].p.y<<"\t"<<Atoms[D->AT[2]].p.z<<"}\tradius\t"<<Atoms[D->AT[2]].radius<<"\tresolution 10\n";
-//cout<<"draw sphere\t{";
-//cout<<Atoms[D->AT[3]].p.x<<"\t"<<Atoms[D->AT[3]].p.y<<"\t"<<Atoms[D->AT[3]].p.z<<"}\tradius\t"<<Atoms[D->AT[3]].radius<<"\tresolution 10\n";
-}
+};
+// (unused debug helpers 'print_face' and 'print_delunay_solid' removed;
+// they printed VMD draw commands to stdout for a single face/tetrahedron
+// and were never called anywhere in the pipeline.)
 void print_delunay(std::ostream& outFile,delunay *D,atom Atoms[],int TYPE=0)
 {
 	outFile<<"##\t";
@@ -712,8 +372,8 @@ void print_delunay(std::ostream& outFile,delunay *D,atom Atoms[],int TYPE=0)
 	//return ;
 	atom *ATOM;
 	ATOM=&(Atoms[D->AT[0]]);
-	 long double Sx,Sy,Sz;
-	 long double Px,Py,Pz;
+	long double Sx,Sy,Sz;
+	long double Px,Py,Pz;
 	Sx=ATOM->p.x-Atoms[D->AT[1]].p.x;
 	Sy=ATOM->p.y-Atoms[D->AT[1]].p.y;
 	Sz=ATOM->p.z-Atoms[D->AT[1]].p.z;
@@ -805,16 +465,19 @@ vect cross_product(vect a1,vect a2)
 	cp.z=a2.y*a1.x-a1.y*a2.x;
 	return cp;
 }
- long double determinant( long double a[3][3])
+/** 3x3 matrix determinant (used to solve the small linear systems that
+ *  locate radical-plane intersection points and circumcenters). */
+long double determinant( long double a[3][3])
 {   
 	return a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])-a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])+a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]);
 }
+/** Solves the 3x3 linear system a*x = b by Cramer's rule. */
 vect cramer( long double a[3][3], long double b[3],int debug=0)
 {   
-	 long double x[3];
-	 long double det_a=determinant(a);
-	 long double det_a1=0.;
-	 long double a_1[3][3];
+	long double x[3];
+	long double det_a=determinant(a);
+	long double det_a1=0.;
+	long double a_1[3][3];
 	if(debug)
 	{
 		cout<<"[";
@@ -875,27 +538,27 @@ vect cramer( long double a[3][3], long double b[3],int debug=0)
 	p.z=x[2];
 	return p;
 }
+/** Radical-plane center of three (possibly differently sized) spheres
+ *  centered at A1, A2, A3 with radii rS, rA, rB: the point equidistant, in
+ *  the power-distance sense, from all three -- the polydisperse analogue of
+ *  a circumcenter used to build the weighted Delaunay tessellation. */
 vect center_of_triangle(vect A1,vect A2,vect A3, long double rS, long double rA, long double rB,int debug=0)
 {
-	 long double ax,ay,az;
-	 long double bx,by,bz;
-	 long double X,Y,Z;
 	vect v21,v31;
 
 	vect center;
 	v21=vectDiff(&A2,&A1);
 	v31=vectDiff(&A3,&A1);
 	// long double rA,rS,rB;
-	 long double DISA;
-	 long double DISB;
+	long double DISA;
+	long double DISB;
 	DISA=sqrtl(magnitudeSq(&v21));
 	DISB=sqrtl(magnitudeSq(&v31));
-	 long double a1,b1,c1,a2,b2,c2,a,b,c;
 	vect v21crossV31=cross_product(&v21,&v31);
 	//a=ZB*YA-ZA*YB;
 	//b=ZA*XB-XA*ZB;
 	//c=YB*XA-YA*XB;
-	 long double B[3],A[3][3];
+	long double B[3],A[3][3];
 
 	B[0]=(DISA*DISA+rS*rS-rA*rA)/2.;
 	B[1]=(DISB*DISB+rS*rS-rB*rB)/2.;
@@ -919,9 +582,12 @@ vect center_of_triangle(vect A1,vect A2,vect A3, long double rS, long double rA,
 	center.z=center.z+A1.z;
 	return center;
 }
- long double volume_delunay(delunay *D,atom Atoms[])
+/** Signed-then-absolute volume of one Delaunay tetrahedron, applying the
+ *  minimum-image convention so tetrahedra spanning a periodic boundary are
+ *  measured correctly. */
+long double volume_delunay(delunay *D,atom Atoms[])
 {
-	 long double a[3][3];
+	long double a[3][3];
 	a[0][0]=Atoms[D->AT[1]].p.x-Atoms[D->AT[0]].p.x;
 	a[0][1]=Atoms[D->AT[1]].p.y-Atoms[D->AT[0]].p.y;
 	a[0][2]=Atoms[D->AT[1]].p.z-Atoms[D->AT[0]].p.z;
@@ -949,13 +615,11 @@ vect center_of_triangle(vect A1,vect A2,vect A3, long double rS, long double rA,
 	a[2][2]=a[2][2]-boxz*PBCz*lroundl(a[2][2]/boxz);
 
 
-	 long double det=determinant(a);
+	long double det=determinant(a);
 	return abs(det/6.);
 }
-void delete_delunay(atom Atoms[],delunay *D,int TYPE)
-{
-	FULLSETD.remove_delunay(D);
-}
+/** Records particles i and j as Delaunay-adjacent ("contiguous"), unless
+ *  the bond is already recorded from either side. */
 void connectAtoms(int i, int j, atom Atoms [])
 {
 	//std::cout<<i<<"\t"<<j<<"\n";
@@ -983,6 +647,115 @@ void connectAtoms(int i, int j, atom Atoms [])
 		//Aj->conti++;
 	}
 }
+/** Links two Delaunay tetrahedra (D_ONE, D_TWO) that share the triangular
+ *  face {ATOM, I, J} as Voronoi-dual neighbors, and classifies the shared
+ *  Voronoi facet/edge as lying inside a sphere or in the void: it is a void
+ *  edge when the segment between the two circumcenters exits the covering
+ *  sphere of every incident particle. */
+void connectDelunayTessellations(delunay* D_ONE, delunay* D_TWO, atom* ATOM, atom Atoms[], int I, int J)
+{
+	if(not(ATOM->check_if_contiguous(I) and ATOM->check_if_contiguous(J)))
+	{
+		std::cerr<<"wrong delunay in connect atoms\n";
+		exit(EXIT_FAILURE);
+	}
+
+	vertice *temp_vert_o=nullptr;
+	vertice *temp_vert_d=nullptr;
+
+	temp_vert_o=D_ONE->v;
+	temp_vert_d=D_TWO->v;
+
+	vect vI = vectDiff(&Atoms[I].p,&ATOM->p);
+	vect vJ = vectDiff(&Atoms[J].p,&ATOM->p);
+
+	vect vert1 = vectDiff(&D_ONE->circumCenter,&ATOM->p);
+	vect vert2 = vectDiff(&D_TWO->circumCenter,&ATOM->p);
+	long double rS=ATOM->radius;
+
+	vect vJcrossI = cross_product(&vJ,&vI);//a=(Y1*Z2-Z1*Y2);
+
+	long double overlap1,overlap2;
+	int sign1,sign2;
+	long double disV1,disV2,disA;
+
+	disV1=sqrtl(magnitudeSq(&vert1));
+	disV2=sqrtl(magnitudeSq(&vert2));
+	if((disV1*disV1-rS*rS)>0.)
+	{
+		temp_vert_o->is_void=1;
+		temp_vert_o->ball_r=disV1-rS;
+	}
+	//disV2=sqrtl((V2x*V2x+V2y*V2y+V2z*V2z));
+	if((disV2*disV2-rS*rS)>0.)
+	{
+		temp_vert_d->is_void=1;
+		temp_vert_d->ball_r=disV2-rS;//sqrtl(disV2*disV2-rS*rS);
+	}
+
+	disA=sqrtl(magnitudeSq(&vJcrossI));
+	overlap1=innerProduct(&vJcrossI,&vert1);
+	overlap2=innerProduct(&vJcrossI,&vert2);
+	if(overlap1<0.)
+		sign1=1;
+	else
+		sign1=-1;
+	//overlap2=a*V2x+b*V2y+c*V2z;
+	if(overlap2<0.)
+		sign2=1;
+	else
+		sign2=-1;
+	bool isBondInVoid=false;
+	if(sign1==sign2)
+	{
+
+		if(overlap1/(disV1*disA)<overlap2/(disV2*disA))
+		{
+			if(temp_vert_o->is_void==1)
+			{
+				//ATOM->D3bondinvoid[{I,J}]=1;
+				//ATOM->D3bondinvoid[{J,I}]=1;
+				isBondInVoid = true;
+			}
+		}
+		else
+		{
+			if(temp_vert_d->is_void==1)
+			{
+				//ATOM->D3bondinvoid[{I,J}]=1;
+				//ATOM->D3bondinvoid[{J,I}]=1;
+				isBondInVoid = true;
+			}
+		}
+	}
+	else
+	{
+		//long double midx,midy,midz;
+		//int p,q,r;
+		//cout<<ATOM->MIDP[i][j].x<<"\t"<<ATOM->MIDP[i][j].y<<"\t"<<ATOM->MIDP[i][j].z<<"\n";
+		vect mid = vectDiff(&ATOM->MIDP[{I,J}],&ATOM->p);
+		//midx=ATOM->MIDP[{i,j}].x-ATOM->p.x;
+		//midy=ATOM->MIDP[{i,j}].y-ATOM->p.y;
+		//midz=ATOM->MIDP[{i,j}].z-ATOM->p.z;
+		//midx=midx-boxx*PBCx*lroundl(midx/boxx);
+		//midy=midy-boxy*PBCy*lroundl(midy/boxy);
+		//midz=midz-boxz*PBCz*lroundl(midz/boxz);
+
+
+		long double dismsq=magnitudeSq(&mid);
+		if((dismsq-rS*rS)>0.)
+		{
+			//ATOM->D3bondinvoid[{I,J}]=1;
+			//ATOM->D3bondinvoid[{J,I}]=1;
+			isBondInVoid = true;
+		}
+	}
+	D_ONE->addNeighbor(D_TWO,std::array<int,3>{ATOM->index,I,J},isBondInVoid);
+	D_TWO->addNeighbor(D_ONE,std::array<int,3>{ATOM->index,I,J},isBondInVoid);
+}
+/** Finalizes a newly constructed Delaunay tetrahedron D: computes its
+ *  circumcenter/Voronoi vertex, accumulates its volume into convex_vol, and
+ *  registers it against the four particles it is built from. */
 void create_delunay(atom Atoms[],delunay *D)
 {
 	//cout<<"ghere\n";
@@ -996,21 +769,18 @@ void create_delunay(atom Atoms[],delunay *D)
 	//temp_v->p->z=D->circum_z;
 	temp_v->D=D;
 	D->v=temp_v;
-	V->insert_vertice(temp_v);
 	for(int a=0; a<3; a++)
 	{
 		for(int b=a+1; b<4; b++)
 		{
 			vect a1,a2,a3,center;
-			vect midp;
-			 long double r1,r2,r3;
+			long double r1,r2,r3;
 			a1=Atoms[D->AT[a]].p;
 			r1=Atoms[D->AT[a]].radius;
 			a2=Atoms[D->AT[b]].p;
 			r2=Atoms[D->AT[b]].radius;
 			//D->MIDP[a][b]=
-			 long double ax,ay,az;
-			 long double X,Y,Z,DISA,l;
+			long double DISA,l;
 			vect a21 = vectDiff(&a2,&a1);
 
 			DISA=sqrtl(magnitudeSq(&a21));
@@ -1103,7 +873,7 @@ void create_delunay(atom Atoms[],delunay *D)
 			{
 				if(ATOM->get_part_c(I,J)==2)
 				{
-					std::cerr << "Error: part_c[" << I << "," << J << "] exceeded 2\n";
+					std::cerr << "\nError: part_c[" << I << "," << J << "] exceeded 2\n";
 					std::cerr << ATOM->index<<"\t"<<Ai->index<<"\t"<<Aj->index<<"\t"<<Ak->index<<"\n";
 					std::cerr << a1 <<"\t"<<a2<<"\t"<<a3<<"\n";
 					std::cerr << ATOM->contiguous.size()<<"\n";
@@ -1111,39 +881,35 @@ void create_delunay(atom Atoms[],delunay *D)
 				}
 			}
 			ATOM->increment_part_c(I,J);
+			ATOM->numFaces++;
 			ATOM->MIDP[{I,J}]=D->MID[k][(k+1)%4][(k+2)%4];
+			if(!ATOM->checkIfIncompleteFace())
+			{
+				/* This atom is completed */
+				incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), ATOM->index), incompleteAtoms.end());
+			}
 			if(ATOM->DelaunayTessellations.find({I,J}) == ATOM->DelaunayTessellations.end())
 				ATOM->DelaunayTessellations[{I,J}] = std::make_pair(D,nullptr);
 			else
+			{
 				ATOM->DelaunayTessellations[{I,J}].second=D;
+				connectDelunayTessellations(ATOM->DelaunayTessellations[{I,J}].first,D,ATOM,Atoms,I,J);
+			}
 		}
-    // Use pair.first and pair.second
+		// Use pair.first and pair.second
 
 		//ATOM->RMID[a1]=D->MIDP[k][(k+1)%4];
 		//ATOM->RMID[a2]=D->MIDP[k][(k+2)%4];
 		//ATOM->RMID[a3]=D->MIDP[k][(k+3)%4];
-
-		if(!ATOM->D_FIRST)
-		{
-			ATOM->D_FIRST=new container_delunay;
-			ATOM->D_FIRST->D=D;
-		}
-		else
-		{
-			container_delunay *temp;
-			temp=ATOM->D_FIRST;
-			while(temp->next)
-			{
-				temp=temp->next;
-			}
-			temp->next=new container_delunay;
-			temp->next->D=D;
-		}
+		ATOM->delunayTetrahedrons.push_back(D);
 	}
 }
+/** Builds the very first Delaunay tetrahedron incident to ATOM (its three
+ *  nearest, non-collinear/non-coplanar neighbors plus ATOM itself), seeding
+ *  the local tessellation that completeDelunayTessellation() then expands
+ *  outward from by rotating around each edge. */
 void first_delunay(atom *ATOM,atom Atoms[])
 {
-	long double drx,dry,drz,dr;
 	long double min=1e10;
 	int A1,A2,A3,A4;
 	A1=ATOM->index;
@@ -1152,7 +918,7 @@ void first_delunay(atom *ATOM,atom Atoms[])
 	//cout<<ATOM->radius<<"\n";
 	for(int i=0; i<nAtoms; i++)
 	{
-		long double rA,rS,DIS,l,dis_i,tan_sq;
+		long double rA,rS,DIS,l;
 		vect neighImAtom = vectDiff(&Atoms[i].p,&ATOM->p);
 
 		DIS=sqrtl(magnitudeSq(&neighImAtom));
@@ -1205,16 +971,16 @@ void first_delunay(atom *ATOM,atom Atoms[])
 			vect a31 = vectDiff(&a3.p,&a1.p);
 			vect a41 = vectDiff(&a4.p,&a1.p);
 
-			 long double B[3],A[3][3];
+			long double B[3],A[3][3];
 
-			 long double r1=a1.radius;
-			 long double r2=a2.radius;
-			 long double r3=a3.radius;
-			 long double r4=a4.radius;
+			long double r1=a1.radius;
+			long double r2=a2.radius;
+			long double r3=a3.radius;
+			long double r4=a4.radius;
 
-			 long double DIS2=sqrtl(magnitudeSq(&a21));
-			 long double DIS3=sqrtl(magnitudeSq(&a31));
-			 long double DIS4=sqrtl(magnitudeSq(&a41));
+			long double DIS2=sqrtl(magnitudeSq(&a21));
+			long double DIS3=sqrtl(magnitudeSq(&a31));
+			long double DIS4=sqrtl(magnitudeSq(&a41));
 
 			B[0]=(DIS2*DIS2+r1*r1-r2*r2)/2.;
 			B[1]=(DIS3*DIS3+r1*r1-r3*r3)/2.;
@@ -1232,7 +998,7 @@ void first_delunay(atom *ATOM,atom Atoms[])
 
 			center=cramer(A,B);
 
-			 long double squaredTangent =center.x*center.x+center.y*center.y+center.z*center.z-r1*r1;
+			long double squaredTangent =center.x*center.x+center.y*center.y+center.z*center.z-r1*r1;
 
 			if(squaredTangent < min)
 			{
@@ -1251,7 +1017,8 @@ void first_delunay(atom *ATOM,atom Atoms[])
 	delunay *D;
 
 	D=new delunay;
-	FULLSETD.insert_delunay(D);
+	fullSet.addTetrahedron(D);
+
 
 	D->AT[0]=EV1[0];
 	D->AT[1]=EV1[1];
@@ -1274,6 +1041,10 @@ void first_delunay(atom *ATOM,atom Atoms[])
 	create_delunay(Atoms,D);
 
 }
+/** Given an existing Delaunay edge (I, J) around ATOM and one known face
+ *  neighbor K, walks the incremental-flip / "gift wrapping" construction to
+ *  find the fourth vertex that completes the next Delaunay tetrahedron on
+ *  the far side of that edge, and creates it via create_delunay(). */
 delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J,int K, long double rI, long double rJ,delunay *D,int debug=0)
 {
 	long double rS=ATOM->radius;
@@ -1298,18 +1069,19 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 	{
 		std::cout<<std::setprecision(16);
 	}
-	for(int j=0; j<nAtoms; j++)
+	for(int atom=0; atom<nAtoms; atom++)
+		//for(auto atom : incompleteAtoms)
 	{
-		int L =j;
+		int L =atom;
 		if(L==K || L ==I || L==J)
 			continue;
-		
-		/* if L is to be successful candidate, then 
-		 Then we will be adding L,I,J L,I,ATOM, L,J,ATOM, I,J,ATOM 
-		 faces to the system. 
 
-		 We need to make sure that adding so does not create 
-		*/
+		/* if L is to be successful candidate, then 
+		   Then we will be adding L,I,J L,I,ATOM, L,J,ATOM, I,J,ATOM 
+		   faces to the system. 
+
+		   We need to make sure that adding so does not create 
+		 */
 
 		int sign_N;
 		vect vL = vectDiff(&Atoms[L].p,&ATOM->p);
@@ -1323,58 +1095,13 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 			sign_N=-1;
 		if(sign!=sign_N) // The atom J lies on the +ve z axis 
 		{
-			int faces[4][3]; 
-			faces[0][0]=L;
-			faces[0][1]=I;
-			faces[0][2]=J;
-
-			faces[1][0]=L;
-			faces[1][1]=I;
-			faces[1][2]=ATOM->index;
-
-			faces[2][0]=L;
-			faces[2][1]=J;
-			faces[2][2]=ATOM->index;
-
-
-			faces[3][0]=I;
-			faces[3][1]=J;
-			faces[3][2]=ATOM->index;
-
-			bool someFaceHasTwoD=false;
-			for(int face=0; face<4; face++)
-			{
-				int triplet[3];
-				triplet[0]=faces[face][0];
-				triplet[1]=faces[face][1];
-				triplet[2]=faces[face][2];
-				for(int k=0; k<3; k++)
-				{
-					int a1=triplet[k];
-					int a2=triplet[(k+1)%3];
-					int a3=triplet[(k+2)%3];
-					if(a2>a3)
-					{
-						if(Atoms[a1].part_c.find({a2,a3})!=Atoms[a1].part_c.end()) 
-							if(Atoms[a1].get_part_c(a2,a3)==2)
-								someFaceHasTwoD=true;
-					}
-					else
-						if(Atoms[a1].part_c.find({a3,a2})!=Atoms[a1].part_c.end()) 
-							if(Atoms[a1].get_part_c(a3,a2)==2)
-								someFaceHasTwoD=true;
-				}
-			}
-			if(someFaceHasTwoD)
-				continue;
-			long double tan_sq;
-			long double DISI=sqrtl(magnitudeSq(&vI));
-			long double DISJ=sqrtl(magnitudeSq(&vJ));
-			long double DISL=sqrtl(magnitudeSq(&vL));
+			long double DISIsq=magnitudeSq(&vI);
+			long double DISJsq=magnitudeSq(&vJ);
+			long double DISLsq=magnitudeSq(&vL);
 			long double B[3],A[3][3];
-			B[0]=(DISI*DISI+rS*rS-rI*rI)/2.;
-			B[1]=(DISJ*DISJ+rS*rS-rJ*rJ)/2.;
-			B[2]=(DISL*DISL+rS*rS-rL*rL)/2.;
+			B[0]=(DISIsq+rS*rS-rI*rI)/2.;
+			B[1]=(DISJsq+rS*rS-rJ*rJ)/2.;
+			B[2]=(DISLsq+rS*rS-rL*rL)/2.;
 			A[0][0]=vI.x;
 			A[0][1]=vI.y;
 			A[0][2]=vI.z;
@@ -1415,195 +1142,39 @@ delunay* constr_del(atom *ATOM,atom Atoms[],vect vI,vect vJ,int sign,int I,int J
 			if(Y_AXIS<Y_MIN)
 			{
 				Y_MIN=Y_AXIS;
-				A4=j;
+				A4=L;
 				circx=X.x;
 				circy=X.y;
 				circz=X.z;
 			}
 		}
 		//}//j loop
-	}
-	if(A4!= -1)
-	{
-		std::vector<int> EV {A1,A2,A3,A4};
-		//std::sort(EV.begin(),EV.end());
-		D=new delunay;
-		FULLSETD.insert_delunay(D);
-		D->AT[0]=EV[0];
-		D->AT[1]=EV[1];
-		D->AT[2]=EV[2];
-		D->AT[3]=EV[3];
-		D->circumCenter.x=circx;
-		D->circumCenter.y=circy;
-		D->circumCenter.z=circz;
-		create_delunay(Atoms,D);
-		return D;
-	}
-	else
-	{
-		return D;
-	}
 }
-void connectDelunayTessellations(delunay* D_ONE, delunay* D_TWO, atom* ATOM, atom Atoms[], int I, int J, int K)
+if(A4!= -1)
 {
-	if(not(ATOM->check_if_contiguous(I) and ATOM->check_if_contiguous(J) and ATOM->check_if_contiguous(K)))
-	{
-		std::cerr<<"wrong delunay in connect atoms\n";
-		exit(EXIT_FAILURE);
-	}
-
-	vertice *temp_vert_o=nullptr;
-	vertice *temp_vert_d=nullptr;
-
-	temp_vert_o=D_ONE->v;
-	temp_vert_d=D_TWO->v;
-
-	vect vI = vectDiff(&Atoms[I].p,&ATOM->p);
-	vect vJ = vectDiff(&Atoms[J].p,&ATOM->p);
-
-
-	long double V1x,V1y,V1z;
-	long double V2x,V2y,V2z;
-
-	vect vert1 = vectDiff(&D_ONE->circumCenter,&ATOM->p);
-	vect vert2 = vectDiff(&D_TWO->circumCenter,&ATOM->p);
-	long double rS=ATOM->radius;
-
-	vect vJcrossI = cross_product(&vJ,&vI);//a=(Y1*Z2-Z1*Y2);
-
-	long double overlap1,overlap2;
-	int sign1,sign2;
-	long double disV1,disV2,disA;
-
-	disV1=sqrtl(magnitudeSq(&vert1));
-	disV2=sqrtl(magnitudeSq(&vert2));
-	if((disV1*disV1-rS*rS)>0.)
-	{
-		temp_vert_o->is_void=1;
-		temp_vert_o->ball_r=disV1-rS;
-	}
-	//disV2=sqrtl((V2x*V2x+V2y*V2y+V2z*V2z));
-	if((disV2*disV2-rS*rS)>0.)
-	{
-		temp_vert_d->is_void=1;
-		temp_vert_d->ball_r=disV2-rS;//sqrtl(disV2*disV2-rS*rS);
-	}
-
-	disA=sqrtl(magnitudeSq(&vJcrossI));
-	overlap1=innerProduct(&vJcrossI,&vert1);
-	overlap2=innerProduct(&vJcrossI,&vert2);
-	if(overlap1<0.)
-		sign1=1;
-	else
-		sign1=-1;
-	//overlap2=a*V2x+b*V2y+c*V2z;
-	if(overlap2<0.)
-		sign2=1;
-	else
-		sign2=-1;
-	if(sign1==sign2)
-	{
-
-		if(overlap1/(disV1*disA)<overlap2/(disV2*disA))
-		{
-			if(temp_vert_o->is_void==1)
-			{
-				ATOM->D3bondinvoid[{I,J}]=1;
-				ATOM->D3bondinvoid[{J,I}]=1;
-			}
-		}
-		else
-		{
-			if(temp_vert_d->is_void==1)
-			{
-				ATOM->D3bondinvoid[{I,J}]=1;
-				ATOM->D3bondinvoid[{J,I}]=1;
-			}
-		}
-	}
-	else
-	{
-		//long double midx,midy,midz;
-		//int p,q,r;
-		//cout<<ATOM->MIDP[i][j].x<<"\t"<<ATOM->MIDP[i][j].y<<"\t"<<ATOM->MIDP[i][j].z<<"\n";
-		vect mid = vectDiff(&ATOM->MIDP[{I,J}],&ATOM->p);
-		//midx=ATOM->MIDP[{i,j}].x-ATOM->p.x;
-		//midy=ATOM->MIDP[{i,j}].y-ATOM->p.y;
-		//midz=ATOM->MIDP[{i,j}].z-ATOM->p.z;
-		//midx=midx-boxx*PBCx*lroundl(midx/boxx);
-		//midy=midy-boxy*PBCy*lroundl(midy/boxy);
-		//midz=midz-boxz*PBCz*lroundl(midz/boxz);
-
-
-		long double dismsq=magnitudeSq(&mid);
-		if((dismsq-rS*rS)>0.)
-		{
-			ATOM->D3bondinvoid[{I,J}]=1;
-			ATOM->D3bondinvoid[{J,I}]=1;
-		}
-	}
-	atom* Ai;
-	atom* Aj;
-	atom* Ak;
-
-	Ai=&(Atoms[I]);
-	Aj=&(Atoms[J]);
-	Ak=&(Atoms[K]);
-	if(temp_vert_o->is_void && !temp_vert_d->is_void)
-	{
-		face *f=nullptr;	
-		f= new face;
-		f->A1=ATOM->p;
-		f->A2=Ai->p;
-		f->A3=Aj->p;
-		f->B=Ak->p;
-		solid_wall.insert_face(f);
-
-	}
-	if(!temp_vert_o->is_void && temp_vert_d->is_void)
-	{
-		face *f=nullptr;	
-		f= new face;
-		f->A1=ATOM->p;
-		f->A2=Ai->p;
-		f->A3=Aj->p;
-		f->B=Ak->p;
-		solid_wall.insert_face(f);
-	}
-	//if(temp_vert_o->is_void && temp_vert_d->is_void && temp_vert_d->D->hull)
-	//{
-	//	face *f=nullptr;	
-	//	f= new face;
-	//	f->A1=ATOM->p;
-	//	f->A2=Ai->p;
-	//	f->A3=Aj->p;
-	//	f->B=Ak->p;
-	//	solid_wall.insert_face(f);
-	//}
-	////if(temp_vert_o->is_void && temp_vert_d->is_void)
-	////{
-	////	cout<<"draw color red\n";
-	////	cout<<"draw line\t{";
-	////	cout<<temp_vert_o->p->x<<"\t"<<temp_vert_o->p->y<<"\t"<<temp_vert_o->p->z<<"}\t{";
-	////	cout<<temp_vert_d->p->x<<"\t"<<temp_vert_d->p->y<<"\t"<<temp_vert_d->p->z<<"}\n";
-	////}
-
-	add_connected(temp_vert_o,temp_vert_d,ATOM->D3bondinvoid[{I,J}]);
-	add_connected(temp_vert_d,temp_vert_o,ATOM->D3bondinvoid[{I,J}]);
-
-	////atom* Ai;
-	////atom* Aj;
-	//Ai=&(Atoms[ATOM->contiguous[i]]);
-	//Aj=&(Atoms[ATOM->contiguous[j]]);
-	ATOM->bond_c[{I,J}]=1;
-	ATOM->bond_c[{J,I}]=1;
-
-	Ai->bond_c[{ATOM->index,Aj->index}]=1;
-	Ai->bond_c[{Aj->index,ATOM->index}]=1;
-
-	Aj->bond_c[{Ai->index,ATOM->index}]=1;
-	Aj->bond_c[{ATOM->index,Ai->index}]=1;
+	std::vector<int> EV {A1,A2,A3,A4};
+	//std::sort(EV.begin(),EV.end());
+	D=new delunay;
+	fullSet.addTetrahedron(D);
+	D->AT[0]=EV[0];
+	D->AT[1]=EV[1];
+	D->AT[2]=EV[2];
+	D->AT[3]=EV[3];
+	D->circumCenter.x=circx;
+	D->circumCenter.y=circy;
+	D->circumCenter.z=circz;
+	create_delunay(Atoms,D);
+	return D;
 }
+else
+{
+	return D;
+}
+}
+/** Marks Delaunay tetrahedron D (built from ATOM, I, J, K) as lying on the
+ *  outer convex hull of ATOM's local neighbor set when no fourth-vertex
+ *  candidate was found on one side of a face, i.e. that face bounds empty
+ *  space rather than another tetrahedron. */
 void convexHull(delunay* D, atom* ATOM, atom Atoms[], int I, int J, int K)
 {
 	atom* Ai;
@@ -1632,54 +1203,28 @@ void convexHull(delunay* D, atom* ATOM, atom Atoms[], int I, int J, int K)
 		Aj->increment_part_c(ATOM->index,Ai->index);
 	else
 		Aj->increment_part_c(Ai->index,ATOM->index);
-	ATOM->bond_c[{I,J}]=1;
-	ATOM->bond_c[{J,I}]=1;
-
-	Ai->bond_c[{ATOM->index,Aj->index}]=1;
-	Ai->bond_c[{Aj->index,ATOM->index}]=1;
-
-	Aj->bond_c[{Ai->index,ATOM->index}]=1;
-	Aj->bond_c[{ATOM->index,Ai->index}]=1;
-
-	face *f=nullptr;	
-	face *f_sw=nullptr;	
-	f= new face;
-	f->A1=ATOM->p;
-	f->A2=Ai->p;
-	f->A3=Aj->p;
-	f_sw= new face;
-	f_sw->A1=ATOM->p;
-	f_sw->A2=Ai->p;
-	f_sw->A3=Aj->p;
-	f->B=Ak->p;
-	if(!ATOM->bor)
+	if(!ATOM->checkIfIncompleteFace())
 	{
-		ATOM->bor=1;
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), ATOM->index), incompleteAtoms.end());
 	}
-	if(!Ai->bor)
+	if(!Ai->checkIfIncompleteFace())
 	{
-		Ai->bor=1;
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), Ai->index), incompleteAtoms.end());
 	}
-	if(!Aj->bor)
+	if(!Aj->checkIfIncompleteFace())
 	{
-		Aj->bor=1;
+		/* This atom is completed */
+		incompleteAtoms.erase(std::remove(incompleteAtoms.begin(), incompleteAtoms.end(), Aj->index), incompleteAtoms.end());
 	}
-	CH.insert_face(f);
-	if(D->v->is_void==0)
-	{
-		solid_wall.insert_face(f_sw);
-	}
-	else
-	{
-		//print_face(f,1);
-	}
-	////if(!convex_hull)
-	////{
-	////	convex_hull=new face;
-	////	convex_hull->A1=	
-	////}
 	D->hull=1;
 }
+/** Expands the local Delaunay tessellation around ATOM until every face
+ *  incident to it is shared by exactly two tetrahedra (or flagged as a
+ *  convex-hull face), i.e. until ATOM's full local neighborhood is closed.
+ *  This is the main per-particle driver called from the BFS loop in
+ *  main(). */
 void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 {
 	//long double MIN = 1e10;
@@ -1687,6 +1232,10 @@ void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 	/* first we have to go through existing delaney tetrahedrons this 
 	   atom has and find an incomplete side, i.e a face that has the 
 	   current atom but is not part of TWO tetrahedrons. */
+	//if(!ATOM->checkIfIncompleteFace())
+	//{
+	//	return;
+	//}	
 	while(newElementAdded)
 	{
 		std::cout<<std::flush;
@@ -1717,7 +1266,6 @@ void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 
 				long double rI=Atoms[I].radius;
 				long double rJ=Atoms[J].radius;
-				long double rK=Atoms[K].radius;
 				int sign;
 				vect vJIcross = cross_product(&vJ,&vI);
 				long double overlap=innerProduct(&vK,&vJIcross);
@@ -1727,42 +1275,17 @@ void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 					sign=-1;
 				delunay *D_TWO = nullptr;
 				D_TWO=constr_del(ATOM,Atoms,vI,vJ,sign,I,J,K,rI,rJ,D_TWO);
-				if(D_TWO)
-				{
-					print_delunay(outputFile,ATOM->DelaunayTessellations[pairIJ.first].first,Atoms);
-					print_delunay(outputFile,D_TWO,Atoms);
-					outputFile<<std::flush;
-					connectDelunayTessellations(ATOM->DelaunayTessellations[pairIJ.first].first,D_TWO,ATOM,Atoms,I,J,K);
-				}
-				else
+				//if(D_TWO)
+				//{
+				//	print_delunay(outputFile,D_TWO,Atoms);
+				//	outputFile<<std::flush;
+				//}
+				if(!D_TWO)
 				{
 					/* part of convex hull */
-					//std::cout<<"do we ever come here \n";
 					convexHull(ATOM->DelaunayTessellations[pairIJ.first].first,ATOM,Atoms,I,J,K);
 				}
 				newElementAdded=true;
-			}
-			else if(ATOM->get_part_c(pairIJ.first.first,pairIJ.first.second)==2)
-			{
-				/* this face is then complete. */ 
-				int I = pairIJ.first.first;
-				int J = pairIJ.first.second;
-				if(!ATOM->bond_c[{I,J}])
-				{
-					int K;
-					for(int k=0; k<4; k++)
-					{
-						if(ATOM->index != ATOM->DelaunayTessellations[pairIJ.first].first->AT[k]) // So that K is not this atom 
-						{
-							if(ATOM->DelaunayTessellations[pairIJ.first].first->AT[k]!=I and ATOM->DelaunayTessellations[pairIJ.first].first->AT[k]!=J)
-							{
-								K = ATOM->DelaunayTessellations[pairIJ.first].first->AT[k];
-								break;
-							}
-						}
-					}
-					connectDelunayTessellations(ATOM->DelaunayTessellations[pairIJ.first].first,ATOM->DelaunayTessellations[pairIJ.first].second,ATOM,Atoms,I,J,K);
-				}
 			}
 		}
 	}
@@ -1770,7 +1293,7 @@ void completeDelunayTessellation(atom *ATOM,atom Atoms[],int nAtoms)
 
 long double volume_tetrahedron( long double Ax, long double Ay, long double Az, long double Ex, long double Ey, long double Ez, long double Bx, long double By, long double Bz, long double vx, long double vy, long double vz, long double r,int compliment=0)
 {
-	 long double ABx,ABy,ABz,EBx,EBy,EBz,VEx,VEy,VEz,DISB,DISBE,DISVE;
+	long double ABx,ABy,ABz,EBx,EBy,EBz,VEx,VEy,VEz,DISB,DISBE,DISVE;
 	//cout<<"draw sphere\t{";
 	//cout<<Ax<<"\t"<<Ay<<"\t"<<Az<<"}\tradius 0.3\n";
 	//cout<<"draw sphere\t{";
@@ -1816,33 +1339,39 @@ long double volume_tetrahedron( long double Ax, long double Ay, long double Az, 
 	vx=sqrtl(DISB);
 	vy=sqrtl(DISBE);
 	vz=sqrtl(DISVE);
-	 long double x0,y0,z0;
-	 long double x0sq,y0sq,z0sq;
+	long double x0,y0,z0;
+	long double x0sq,y0sq,z0sq;
 	x0=Bx;
 	y0=Ey;
 	z0=vz;
 	x0sq=DISB;
 	y0sq=DISBE;
 	z0sq=DISVE;
-	 long double rB,rV,rE;
+	long double rB,rV,rE;
 	rV=sqrtl(vx*vx+vy*vy+vz*vz);
 	rE=sqrtl(Ex*Ex+Ey*Ey+Ez*Ez);
 	rB=sqrtl(DISB);
-	 long double theta,x2,y2;
+	long double theta,x2,y2;
 	x2=r*x0/rE;
 	y2=r*y0/rE;
 	theta=atanl(z0/y0);
-	 long double Vc,Vt;
+	long double Vc,Vt;
 	Vt=(x0*y0*z0)/6.;
 	Vc=0.;
 	if(r<rB)
 	{
-		Vc=(r*r*r/6.)*(2*theta-M_PI/2.-asinl((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq))));
+		if(abs((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq)))>1)
+			Vc=(r*r*r/6.)*(2*theta);
+		else
+			Vc=(r*r*r/6.)*(2*theta-M_PI/2.-asinl((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq))));
 		//cout<<Vc<<"\n";
 	}
 	if(rB<r && r<rE)
 	{
-		Vc=theta/2.*(r*r*x0-x0*x0*x0/3.)-(r*r*r/6.)*(M_PI/2.+asinl((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq))));
+		if(abs((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq)))>1)
+			Vc=theta/2.*(r*r*x0-x0*x0*x0/3.);
+		else
+			Vc=theta/2.*(r*r*x0-x0*x0*x0/3.)-(r*r*r/6.)*(M_PI/2.+asinl((z0sq*x0sq-y0sq*rV*rV)/(rE*rE*(y0sq+z0sq))));
 		//cout<<Vc<<"\n";
 	}
 	if(rE<r && r<rV)
@@ -1865,12 +1394,15 @@ long double volume_tetrahedron( long double Ax, long double Ay, long double Az, 
 			return Vc;
 	}
 }
+/** Orientation predicate: sign of the volume of the tetrahedron
+ *  (A1, A2, A3, V), used to test which side of the plane through A1,A2,A3
+ *  the point V lies on. */
 int sign_aaav( long double A1x, long double A1y, long double A1z, long double A2x, long double A2y, long double A2z, long double A3x, long double A3y, long double A3z, long double A4x, long double A4y, long double A4z, long double Vx, long double Vy, long double Vz)
 {
-	 long double a1x,a1y,a1z;
-	 long double a2x,a2y,a2z;
-	 long double a3x,a3y,a3z;
-	 long double vx,vy,vz;
+	long double a1x,a1y,a1z;
+	long double a2x,a2y,a2z;
+	long double a3x,a3y,a3z;
+	long double vx,vy,vz;
 	a1x=A2x-A1x;
 	a1y=A2y-A1y;
 	a1z=A2z-A1z;
@@ -1899,8 +1431,8 @@ int sign_aaav( long double A1x, long double A1y, long double A1z, long double A2
 	a2y=a2y-boxy*PBCy*lroundl(a2y/boxy);
 	a2z=a2z-boxz*PBCz*lroundl(a2z/boxz);
 
-	 long double a,b,c;
-	 long double overlap1,overlap2;
+	long double a,b,c;
+	long double overlap1,overlap2;
 	int sign1,sign2;
 	a=a2z*a1y-a1z*a2y;
 	b=a1z*a2x-a1x*a2z;
@@ -1924,11 +1456,14 @@ int sign_aaav( long double A1x, long double A1y, long double A1z, long double A2
 		return -1;
 	}
 }
+/** Orientation predicate: sign of the projection of edge (A1..E) relative
+ *  to the plane through A1, A2, A3, used to test which side of a Delaunay
+ *  face an edge direction points toward. */
 int sign_aaae( long double A1x, long double A1y, long double A1z, long double A2x, long double A2y, long double A2z, long double A3x, long double A3y, long double A3z, long double Ex, long double Ey, long double Ez)
 {
-	 long double a1x,a1y,a1z;
-	 long double a2x,a2y,a2z;
-	 long double ex,ey,ez;
+	long double a1x,a1y,a1z;
+	long double a2x,a2y,a2z;
+	long double ex,ey,ez;
 	a1x=A1x-A2x;
 	a1y=A1y-A2y;
 	a1z=A1z-A2z;
@@ -1950,15 +1485,15 @@ int sign_aaae( long double A1x, long double A1y, long double A1z, long double A2
 	ey=ey-boxy*PBCy*lroundl(ey/boxy);
 	ez=ez-boxz*PBCz*lroundl(ez/boxz);
 
-	 long double a,b,c;
-	 long double a1,b1,c1;
+	long double a,b,c;
+	long double a1,b1,c1;
 	a=a2z*a1y-a1z*a2y;
 	b=a1z*a2x-a1x*a2z;
 	c=a2y*a1x-a1y*a2x;
 	a1=c*a1y-a1z*b;
 	b1=a1z*a-a1x*c;
 	c1=b*a1x-a1y*a;
-	 long double overlap1,overlap2;
+	long double overlap1,overlap2;
 	int sign1,sign2;
 	overlap1=a1*ex+b1*ey+c1*ez;
 	if(overlap1<0.)
@@ -1985,69 +1520,43 @@ int sign_aaae( long double A1x, long double A1y, long double A1z, long double A2
 	else
 		return -1;
 }
-void initialization(atom Atoms[],int nAtoms)
-{
-	//contiguous = new (nothrow) int* [nAtoms];
-	V=new vert_list;
-	for(int i=0; i<nAtoms; i++)
-	{
-		//Atoms[i].conti_index = new (nothrow) int  [nAtoms];
-		//contiguous[i] = new (nothrow) int [nAtoms];
-	//}
-	//for(int i=0;i<nAtoms;i++)
-	//{
-
-		Atoms[i].Cstart=nullptr;
-		Atoms[i].D_FIRST=nullptr;
-		//Atoms[i].conti=0;
-
-		//for(int j=0; j<nAtoms; j++)
-		//{
-		//	//Atoms[i].conti_index[j]=-1;
-		//	contiguous[i][j]=0;
-		//}
-	}
-}
-void delete_everything(atom Atoms[],int nAtoms,int ntypes)
-{
-	//for(int i=0; i<nAtoms; i++)
-	//{
-	//	delete[] Atoms[i].conti_index;
-	//}
-}
+/** Tests whether Voronoi vertex v (the circumcenter of tetrahedron D) truly
+ *  lies inside D's own tetrahedron. Used to peel away convex-hull
+ *  tetrahedra whose circumcenter falls outside their own volume (which
+ *  would otherwise be wrongly counted as void space at the packing's
+ *  boundary). */
 bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 {
-	vect V1;	
-	vect V2;	
-	vect V;
-	vect A;
 	int sign1,sign2;
-	 long double overlap1,overlap2;	
+	long double overlap1,overlap2;	
 	atom *a1=&(Atoms[D->AT[0]]);
 	atom *a2=&(Atoms[D->AT[1]]);;
 	atom *a3=&(Atoms[D->AT[2]]);;
 	atom *a4=&(Atoms[D->AT[3]]);;
+	vect v2 = vectDiff(&a2->p,&a1->p);
+	vect v3 = vectDiff(&a3->p,&a1->p);
+	vect v4 = vectDiff(&a4->p,&a1->p);
+	vect V = vectDiff(v->p,&a1->p);
+	//V1.x=a2->p.x-a1->p.x;
+	//V1.y=a2->p.y-a1->p.y;
+	//V1.z=a2->p.z-a1->p.z;
 
-	V1.x=a2->p.x-a1->p.x;
-	V1.y=a2->p.y-a1->p.y;
-	V1.z=a2->p.z-a1->p.z;
+	//V2.x=a3->p.x-a1->p.x;
+	//V2.y=a3->p.y-a1->p.y;
+	//V2.z=a3->p.z-a1->p.z;
 
-	V2.x=a3->p.x-a1->p.x;
-	V2.y=a3->p.y-a1->p.y;
-	V2.z=a3->p.z-a1->p.z;
+	//V.x=v->p->x-a1->p.x;
+	//V.y=v->p->y-a1->p.y;
+	//V.z=v->p->z-a1->p.z;
 
-	V.x=v->p->x-a1->p.x;
-	V.y=v->p->y-a1->p.y;
-	V.z=v->p->z-a1->p.z;
+	//A.x=a4->p.x-a1->p.x;
+	//A.y=a4->p.y-a1->p.y;
+	//A.z=a4->p.z-a1->p.z;
 
-	A.x=a4->p.x-a1->p.x;
-	A.y=a4->p.y-a1->p.y;
-	A.z=a4->p.z-a1->p.z;
-
-	vect cross_12;
-	cross_12=cross_product(V1,V2);
-	overlap1=cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
-	overlap2=cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
+	vect cross;
+	cross=cross_product(&v2,&v3);
+	overlap1=innerProduct(&cross,&v4);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
+	overlap2=innerProduct(&cross,&V);//cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
 	if(overlap1<0.)
 		sign1=1;
 	else
@@ -2060,21 +1569,9 @@ bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 
 	if(sign1==sign2)
 	{
-		V1.x=a2->p.x-a1->p.x;
-		V1.y=a2->p.y-a1->p.y;
-		V1.z=a2->p.z-a1->p.z;
-		V2.x=a4->p.x-a1->p.x;
-		V2.y=a4->p.y-a1->p.y;
-		V2.z=a4->p.z-a1->p.z;
-		V.x=v->p->x-a1->p.x;
-		V.y=v->p->y-a1->p.y;
-		V.z=v->p->z-a1->p.z;
-		A.x=a3->p.x-a1->p.x;
-		A.y=a3->p.y-a1->p.y;
-		A.z=a3->p.z-a1->p.z;
-		cross_12=cross_product(V1,V2);
-		overlap1=cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
-		overlap2=cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
+		cross=cross_product(&v2,&v4);
+		overlap1=innerProduct(&cross,&v3);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
+		overlap2=innerProduct(&cross,&V);//cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
 		if(overlap1<0.)
 			sign1=1;
 		else
@@ -2086,21 +1583,9 @@ bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 			sign2=-1;
 		if(sign1==sign2)
 		{
-			V1.x=a3->p.x-a1->p.x;
-			V1.y=a3->p.y-a1->p.y;
-			V1.z=a3->p.z-a1->p.z;
-			V2.x=a4->p.x-a1->p.x;
-			V2.y=a4->p.y-a1->p.y;
-			V2.z=a4->p.z-a1->p.z;
-			V.x=v->p->x-a1->p.x;
-			V.y=v->p->y-a1->p.y;
-			V.z=v->p->z-a1->p.z;
-			A.x=a2->p.x-a1->p.x;
-			A.y=a2->p.y-a1->p.y;
-			A.z=a2->p.z-a1->p.z;
-			cross_12=cross_product(V1,V2);
-			overlap1=cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
-			overlap2=cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
+			cross=cross_product(&v3,&v4);
+			overlap1=innerProduct(&cross,&v2);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
+			overlap2=innerProduct(&cross,&V);//cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
 			if(overlap1<0.)
 				sign1=1;
 			else
@@ -2112,21 +1597,13 @@ bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 				sign2=-1;
 			if(sign1==sign2)
 			{
-				V1.x=a3->p.x-a2->p.x;
-				V1.y=a3->p.y-a2->p.y;
-				V1.z=a3->p.z-a2->p.z;
-				V2.x=a4->p.x-a2->p.x;
-				V2.y=a4->p.y-a2->p.y;
-				V2.z=a4->p.z-a2->p.z;
-				V.x=v->p->x-a2->p.x;
-				V.y=v->p->y-a2->p.y;
-				V.z=v->p->z-a2->p.z;
-				A.x=a1->p.x-a2->p.x;
-				A.y=a1->p.y-a2->p.y;
-				A.z=a1->p.z-a2->p.z;
-				cross_12=cross_product(V1,V2);
-				overlap1=cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
-				overlap2=cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
+				vect v2 = vectDiff(&a1->p,&a2->p);
+				vect v3 = vectDiff(&a3->p,&a2->p);
+				vect v4 = vectDiff(&a4->p,&a2->p);
+				vect V = vectDiff(v->p,&a2->p);
+				cross=cross_product(&v3,&v4);
+				overlap1=innerProduct(&cross,&v2);//cross_12.x*A.x+cross_12.y*A.y+cross_12.z*A.z;
+				overlap2=innerProduct(&cross,&V);//cross_12.x*V.x+cross_12.y*V.y+cross_12.z*V.z;
 				if(overlap1<0.)
 					sign1=1;
 				else
@@ -2150,21 +1627,24 @@ bool inside_delunay(vertice *v,delunay *D,atom Atoms[],int nAtoms)
 	else
 		return false;
 }
+/** Computes the exact void-space volume attributable to Voronoi vertex v,
+ *  i.e. the piece of the empty-space region around this vertex that is not
+ *  covered by any of the (dilated) particle spheres. Summed over every
+ *  void vertex in a cluster, this gives that cavity's total void volume. */
 long double void_vol(vertice *v,atom Atoms[])
 {
-	 long double vol=0.;
+	long double vol=0.;
 	vect A1,A2,A3,A4;
-	 long double E1x,E1y,E1z;
-	 long double r1,r2,r3,r4;
+	long double r1,r2,r3,r4;
 	int S123,S124,S234,S134;
 	int A1A2E123,A1A3E123,A2A3E123;
 	int A1A2E124,A1A4E124,A2A4E124;
 	int A1A3E134,A1A4E134,A3A4E134;
 	int A2A3E234,A2A4E234,A3A4E234;
 	// long double Vx,Vy,Vz;
-	 long double Vx=v->p->x;
-	 long double Vy=v->p->y;
-	 long double Vz=v->p->z;
+	long double Vx=v->p->x;
+	long double Vy=v->p->y;
+	long double Vz=v->p->z;
 
 
 	A1=Atoms[v->D->AT[0]].p;
@@ -2179,9 +1659,6 @@ long double void_vol(vertice *v,atom Atoms[])
 
 	vect E123,E124,E134,E234;
 	vect B12,B13,B14,B23,B34,B24;
-	 long double MIDP234x,MIDP234y,MIDP234z;
-	vect a1,a2,a3,a4;
-	 long double X,Y,Z;
 
 	S123=sign_aaav(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,Vx,Vy,Vz);
 	S124=sign_aaav(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A4.x,A4.y,A4.z,A3.x,A3.y,A3.z,Vx,Vy,Vz);
@@ -2246,596 +1723,464 @@ long double void_vol(vertice *v,atom Atoms[])
 
 	return vol;
 }
+/*
+ * Prints command-line usage information to stderr.
+ */
+static void printUsage(const char *progName)
+{
+	std::cerr
+		<< "Usage: " << progName << " <input_file> <probe_radius> [output_dir] [sample_atom_index]\n\n"
+		<< "  input_file          Path to the packing file (see README.md for the exact format).\n"
+		<< "  probe_radius        Non-negative probe radius (r_cut), added to every particle's\n"
+		<< "                      radius before the void-volume analysis. Use 0 for the exact\n"
+		<< "                      void volume of the packing as given.\n"
+		<< "  output_dir          Optional. Directory where all output files are written; created\n"
+		<< "                      if it does not already exist. Defaults to the current directory.\n"
+		<< "  sample_atom_index   Optional. 0-based index of one particle whose local Voronoi cell\n"
+		<< "                      is additionally written to 'demo.txt' (and appended to\n"
+		<< "                      'voronoiEdges.txt') for a quick, small-scale visual check.\n"
+		<< "                      Defaults to 0. Must satisfy 0 <= index < number of particles.\n";
+}
+
 int main( int argc, char * argv[] )
 {
-	atom *Atoms=nullptr;
-	int config_count=0;
-	//The file with configurations
-	std::ifstream infile(argv[1]);///dat_trial");//config_2000_0.38_2_0.70.dat");
-				      //No of Atoms
-	infile>>nAtoms; 
-	//std::cout<<"Number of Atoms"<<nAtoms<<"\n";
-	//No of configurations in the input file
-	config_count=1;
-	//No of types of particle
-	 long double b,c,d,e,f;
-	//radiuses of the particle
-	//nAtoms=0;
-	Atoms = new (nothrow) atom[nAtoms];
-	initialization(Atoms,nAtoms);
-	//std::cout<<"initialization Done\n";
-	char buffer[64];
-	vertice *temp_vect=nullptr;
-	//This loop is over all the configurations
-	 long double SIGMA = 1;//
+	if(argc < 3 || argc > 5)
+	{
+		printUsage(argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	// --- probe radius -------------------------------------------------
+	long double requestedProbeRadius;
+	try
+	{
+		requestedProbeRadius = std::stold(argv[2]);
+	}
+	catch(const std::exception &e)
+	{
+		std::cerr<<"Error: could not parse probe_radius '"<<argv[2]<<"': "<<e.what()<<"\n";
+		return EXIT_FAILURE;
+	}
+	if(requestedProbeRadius < 0.0L)
+	{
+		std::cerr<<"Error: probe_radius must be >= 0 (got "<<argv[2]<<")\n";
+		return EXIT_FAILURE;
+	}
+	r_cut = requestedProbeRadius;
+
+	// --- output directory ----------------------------------------------
+	std::string outDir = (argc >= 4) ? argv[3] : ".";
+	while(outDir.size() > 1 && outDir.back() == '/')
+		outDir.pop_back();
+	if(mkdir(outDir.c_str(), 0755) != 0 && errno != EEXIST)
+	{
+		std::cerr<<"Error: could not create output directory '"<<outDir<<"': "<<std::strerror(errno)<<"\n";
+		return EXIT_FAILURE;
+	}
+	const std::string outPrefix = outDir + "/";
+
+	// --- input file ------------------------------------------------------
+	std::ifstream infile(argv[1]);
+	if(!infile)
+	{
+		std::cerr<<"Error: could not open input file '"<<argv[1]<<"'\n";
+		return EXIT_FAILURE;
+	}
+	infile>>nAtoms;
+	if(!infile || nAtoms <= 0)
+	{
+		std::cerr<<"Error: input file '"<<argv[1]<<"' must begin with a positive particle count.\n";
+		return EXIT_FAILURE;
+	}
+
+	// --- optional sample-atom index for the small demo/QC export -------
+	int sampleAtom = 0;
+	if(argc >= 5)
+	{
+		try
+		{
+			sampleAtom = std::stoi(argv[4]);
+		}
+		catch(const std::exception &e)
+		{
+			std::cerr<<"Error: could not parse sample_atom_index '"<<argv[4]<<"': "<<e.what()<<"\n";
+			return EXIT_FAILURE;
+		}
+	}
+	if(sampleAtom < 0 || sampleAtom >= nAtoms)
+	{
+		std::cerr<<"Error: sample_atom_index ("<<sampleAtom<<") must be in [0, "<<nAtoms<<").\n";
+		return EXIT_FAILURE;
+	}
+
+	atom *Atoms = new (nothrow) atom[nAtoms];
+	if(!Atoms)
+	{
+		std::cerr<<"Error: failed to allocate memory for "<<nAtoms<<" particles.\n";
+		return EXIT_FAILURE;
+	}
+
+	outputFile.open(outPrefix + "delaunay_edges.txt");
+
+	long double b,c,d,e;
+	// SIGMA is a leftover unit-rescaling hook (always 1 here); kept so the
+	// input length scale can be trivially reduced/expanded in the future
+	// without touching the geometry routines below.
+	long double SIGMA = 1;
 	long double volumeBox=0.;
 	long double volumeAtoms=0.;
-	r_cut = std::stod(argv[2]);
-	for(int nconfig=0; nconfig<config_count; nconfig++)
+	int counter=0;
+	infile>>boxx>>boxy>>boxz;
+	if(!infile || boxx <= 0.0L || boxy <= 0.0L || boxz <= 0.0L)
 	{
-		int counter=0;
-		infile>>boxx>>boxy>>boxz;
-		boxx = boxx/SIGMA;
-		boxy = boxy/SIGMA;
-		boxz = boxz/SIGMA;
-		//std::cout<<"Box size\t"<<boxx<<"\t"<<boxy<<"\t"<<boxz<<"\n";;
-		volumeBox=boxx*boxy*boxz;
-		while(infile>>b>>c>>d>>e)
+		std::cerr<<"Error: input file '"<<argv[1]<<"' must specify a positive box size (boxx boxy boxz) on the second line.\n";
+		delete [] Atoms;
+		return EXIT_FAILURE;
+	}
+	boxx = boxx/SIGMA;
+	boxy = boxy/SIGMA;
+	boxz = boxz/SIGMA;
+	volumeBox=boxx*boxy*boxz;
+	while(infile>>b>>c>>d>>e)
+	{
+		Atoms[counter].p.x=b/SIGMA;
+		Atoms[counter].p.y=c/SIGMA;
+		Atoms[counter].p.z=d/SIGMA;
+		Atoms[counter].radius=(e/SIGMA)+r_cut;
+		Atoms[counter].index=counter;
+		volumeAtoms=volumeAtoms+Atoms[counter].radius*Atoms[counter].radius*Atoms[counter].radius*4./3.*M_PI;
+		incompleteAtoms.push_back(counter);
+		allAtoms.push_back(counter);
+		counter++;
+		if(counter==nAtoms)
 		{
-			Atoms[counter].p.x=b/SIGMA;
-			Atoms[counter].p.y=c/SIGMA;
-			Atoms[counter].p.z=d/SIGMA;
-			Atoms[counter].radius=(e/SIGMA)+r_cut;
-			Atoms[counter].index=counter;
-			//Atoms[counter].neighbours=0;
-			volumeAtoms=volumeAtoms+Atoms[counter].radius*Atoms[counter].radius*Atoms[counter].radius*4./3.*M_PI;
-			//std::cout<<counter<<"\t"<<b<<"\t"<<c<<"\t"<<d<<"\t"<<e<<"\n";
-			counter++;
-			if(counter==nAtoms)
-			{
-				break;
-			}
+			break;
 		}
+	}
+	if(counter != nAtoms)
+	{
+		std::cerr<<"Error: input file '"<<argv[1]<<"' declares "<<nAtoms
+			<<" particles but only "<<counter<<" coordinate lines were found.\n";
+		delete [] Atoms;
+		return EXIT_FAILURE;
+	}
 
-		//check_configuration(Atoms,nAtoms);//,6e-1/SIGMA);
-		long double area=0;
-		vertice *save=nullptr;
+	// Breadth-first traversal of the Delaunay neighbor graph, starting from
+	// particle 0. This assumes the packing forms a single connected Delaunay
+	// complex reachable from particle 0, which holds for any ordinary sphere
+	// packing; see README.md for the periodic-boundary-condition caveat.
+	atomsToAnalyze.push_back(0);
+	processedOrQueuedAtoms.insert(0);
+	//for(int i=0; i< nAtoms; i++)
+	int index=0;
+	while (!atomsToAnalyze.empty()) 
+	{
+		// Get the next atom from the front of the queue
+		int iAtom = atomsToAnalyze.front();
 
-		int max_conti=0;
-		int max_conti_index=-1;
-		//std::vector<int> atomsToAnalyze={0};
-		std::deque<int> atomsToAnalyze;
-
-		// 2. A "has-been-seen" list. std::unordered_set provides very fast
-		//    checking to see if an atom has already been added. This is the key
-		//    to ensuring uniqueness and preventing infinite loops.
-		std::unordered_set<int> processedOrQueuedAtoms;
-		atomsToAnalyze.push_back(0);
-		processedOrQueuedAtoms.insert(0);
-		//for(int i=0; i< nAtoms; i++)
-		int index=0;
-		while (!atomsToAnalyze.empty()) 
+		atomsToAnalyze.pop_front();
+		std::cout << "Processing atom: " << std::left << std::setw(8) << iAtom << "\t"<<index<<"\t" << std::fixed << std::setprecision(2) << std::setw(6) << (index* 100.0 / nAtoms) << "%  \r" << std::flush;
+		index++;
+		if(Atoms[iAtom].delunayTetrahedrons.size()==0)
 		{
-			// Get the next atom from the front of the queue
-			//int iAtom = i;
-			int iAtom = atomsToAnalyze.front();
-
-			atomsToAnalyze.pop_front();
+			first_delunay(&(Atoms[iAtom]),Atoms);
+		}
+		if(Atoms[iAtom].delunayTetrahedrons.size())
+			completeDelunayTessellation(&(Atoms[iAtom]),Atoms,nAtoms);
+		//std::cout<<iAtom<<"\t"<<Atoms[iAtom].contiguous.size()<<"\n";
+		allAtoms.erase(std::remove(allAtoms.begin(), allAtoms.end(), iAtom), allAtoms.end());
+		//for (const auto& element : allAtoms)
 		//{
-			//std::cout<<iAtom<<"\n";
-			//int iAtom=atomsToAnalyze[i];
-			//cout<<iAtom<<"\t"<<index*1./nAtoms<<"\r";
-			//std::cout << "Processing atom: " << iAtom << "\t" << (index* 100.0 / nAtoms) << "%\r" << std::flush;
-			std::cout << "Processing atom: " << std::left << std::setw(8) << iAtom << "\t" << std::fixed << std::setprecision(2) << std::setw(6) << (index* 100.0 / nAtoms) << "%  \r" << std::flush;
-
-
-			index++;
-			//cout<<Atoms[29].conti<<" conitgues for 29\n";
-			//cout<<Atoms[iAtom].radius<<"\n";
-			if(!Atoms[iAtom].D_FIRST)
-			{
-				first_delunay(&(Atoms[iAtom]),Atoms);
-			}
-			if(Atoms[iAtom].D_FIRST)
-				completeDelunayTessellation(&(Atoms[iAtom]),Atoms,nAtoms);
-				//complete_del_2(&(Atoms[iAtom]),Atoms,nAtoms);
-			//break;
-			for(int neighborAtom:Atoms[iAtom].contiguous)
-			{
-				if (processedOrQueuedAtoms.count(neighborAtom) == 0) {
-					// If it's a new atom, add it to both the "to-do" list
-					// and the "has-been-seen" list.
-					processedOrQueuedAtoms.insert(neighborAtom);
-					atomsToAnalyze.push_back(neighborAtom);
-				}
-			}
-			container_delunay *temp_d=nullptr;
-			temp_d=Atoms[iAtom].D_FIRST;
-			Atoms[iAtom].S = new set_of_cvert;
-			while(temp_d)
-			{			   
-				container_vertice *temp=nullptr;
-				temp = new container_vertice;
-				temp->V=temp_d->D->v;
-				Atoms[iAtom].S->insert_cvert(temp);
-				temp_d=temp_d->next;
+		//	std::cout << element << " ";
+		//}
+		//cout<<"\n";
+		for(int neighborAtom:Atoms[iAtom].contiguous)
+		{
+			if (processedOrQueuedAtoms.count(neighborAtom) == 0) {
+				// If it's a new atom, add it to both the "to-do" list
+				// and the "has-been-seen" list.
+				processedOrQueuedAtoms.insert(neighborAtom);
+				atomsToAnalyze.push_back(neighborAtom);
 			}
 		}
-		std::cout<<"processing done\n";
-		std::cout<<std::setprecision(16);
-		std::cout<<convex_vol<<"\t"<<boxx*boxy*boxz<<"\n";
-		//{
-		std::ofstream atomInfoOutputFile("atoms.txt");
-		atomInfoOutputFile<<"draw color 12\n";
-		for(int iAtom=0; iAtom< nAtoms; iAtom++)
+	}
+	std::cout<<"processing done\n";
+	std::cout<<std::setprecision(16);
+	// Diagnostic: the sum of all Delaunay tetrahedron volumes should equal
+	// the box volume for a geometrically consistent periodic tessellation.
+	std::cout<<"Sum of Delaunay tetrahedron volumes vs. box volume:\n";
+	std::cout<<convex_vol<<"\t"<<boxx*boxy*boxz<<"\n";
+	std::ofstream atomInfoVMDOutputFile(outPrefix + "atoms.txt");
+	std::ofstream atomInfoOutputFile(outPrefix + "atomsPOVRAY.txt");
+	atomInfoOutputFile<<std::setprecision(16);
+	for(int iAtom=0; iAtom< nAtoms; iAtom++)
+	{
+		atomInfoVMDOutputFile<<"draw sphere\t{";
+		atomInfoVMDOutputFile<<Atoms[iAtom].p.x<<"\t"<<Atoms[iAtom].p.y<<"\t"<<Atoms[iAtom].p.z<<"}\tradius\t"<<Atoms[iAtom].radius<<"\t"<<"resolution\t10\n";
+		atomInfoOutputFile<<"1,\t";
+		atomInfoOutputFile<<Atoms[iAtom].p.x<<",\t"<<Atoms[iAtom].p.z<<",\t"<<Atoms[iAtom].p.y<<","<<Atoms[iAtom].radius;
+		atomInfoOutputFile<<",\n";
+	}
+	outputFile<<"draw color 11\n";
+	for(auto D : fullSet.tetrahedrons)
+	{
+		print_delunay(outputFile,D,Atoms);
+	}
+	std::ofstream voroInfoOutputFile(outPrefix + "voronoiEdges.txt");
+	voroInfoOutputFile<<std::setprecision(16);
+	voroInfoOutputFile<<"draw color 11\n";
+	for(int atom =0; atom < nAtoms; atom++)
+	{
+		// Voronoi (radical-plane) edges for every atom, in the same
+		// POV-Ray-style CSV format as the atom spheres above: shape code 2
+		// followed by the two circumcenter endpoints and a display radius.
+		for(auto delFace: Atoms[atom].DelaunayTessellations)
 		{
-			//std::cout<<Atoms[iAtom].p.x<<"\t"<<Atoms[iAtom].p.y<<"\t"<<Atoms[iAtom].p.z<<"}\tradius\t"<<Atoms[iAtom].radius<<"\n";
-			atomInfoOutputFile<<"draw sphere\t{";
-			atomInfoOutputFile<<Atoms[iAtom].p.x<<"\t"<<Atoms[iAtom].p.y<<"\t"<<Atoms[iAtom].p.z<<"}\tradius\t"<<Atoms[iAtom].radius<<"\t"<<"resolution\t10\n";
+			auto v1 = delFace.second.first->circumCenter;
+			auto v2 = delFace.second.second->circumCenter;
+			vect V1 = vectDiff(&v1, &Atoms[atom].p);
+			vect V2 = vectDiff(&v2, &Atoms[atom].p);
+			atomInfoOutputFile<<"2,\t";
+			atomInfoOutputFile<<V1.x+Atoms[atom].p.x<<",\t"<<V1.z+Atoms[atom].p.z<<",\t"<<V1.y+Atoms[atom].p.y<<",\t";
+			atomInfoOutputFile<<V2.x+Atoms[atom].p.x<<",\t"<<V2.z+Atoms[atom].p.z<<",\t"<<V2.y+Atoms[atom].p.y<<", 5e-4,\n";
 		}
-		//return 0;
+	}
 
+	// Small single-particle export ('demo.txt' + a few extra VMD draw
+	// commands appended to voronoiEdges.txt) for quickly sanity-checking
+	// one particle's local geometry without rendering the whole system.
+	// Rendering every particle's Voronoi cell as individual VMD 'draw'
+	// commands would be extremely slow, so this is intentionally scoped to
+	// a single, user-selectable particle (--sample_atom_index, default 0).
+	{
+		std::ofstream demoFile(outPrefix + "demo.txt");
+		demoFile<<std::setprecision(16);
+		const int atom = sampleAtom;
 
-
-		outputFile<<"draw color 11\n";
-		delunay *temp_d;
-		temp_d=FULLSETD.initial;
-		while(temp_d)
+		voroInfoOutputFile<<"# \t"<<atom<<"\n";
+		voroInfoOutputFile<<"draw sphere\t{";
+		voroInfoOutputFile<<Atoms[atom].p.x<<"\t"<<Atoms[atom].p.z<<"\t"<<Atoms[atom].p.y<<"}\tradius\t"<<Atoms[atom].radius<<"\t"<<"resolution\t10\n";
+		demoFile<<"3,\t";
+		demoFile<<Atoms[atom].p.x<<",\t"<<Atoms[atom].p.z<<",\t"<<Atoms[atom].p.y<<",\t"<<Atoms[atom].radius<<",\n";
+		for(auto neiA : Atoms[atom].contiguous)
 		{
-			//cout<<temp_d->AT[0]<<"\t"<<temp_d->AT[1]<<"\t"<<temp_d->AT[2]<<"\t"<<temp_d->AT[3]<<"\n";
-			print_delunay(outputFile,temp_d,Atoms);
-			temp_d = temp_d->next;
+			vect V = vectDiff(&Atoms[atom].p,&Atoms[neiA].p);
+			demoFile<<"1,\t";
+			demoFile<<Atoms[atom].p.x-V.x<<",\t"<<Atoms[atom].p.z-V.z<<",\t"<<Atoms[atom].p.y-V.y<<",\t"<<Atoms[neiA].radius<<",\n";
+			voroInfoOutputFile<<"draw sphere\t{";
+			voroInfoOutputFile<<Atoms[atom].p.x-V.x<<"\t"<<Atoms[atom].p.z-V.z<<"\t"<<Atoms[atom].p.y-V.y<<"}\tradius\t"<<Atoms[neiA].radius<<"\t"<<"resolution\t10\n";
 		}
-
-
-
-		vertice *temp=nullptr;
-		temp=V->initial;
-		while(1)
+		for(auto element:Atoms[atom].part_c)
 		{
-			if(temp->D->hull)
+			int I=element.first.first;
+			int J=element.first.second;
+			vect V1 = vectDiff(&Atoms[atom].p,&Atoms[I].p);
+			vect V2 = vectDiff(&Atoms[atom].p,&Atoms[J].p);
+			demoFile<<"4,\t";
+			demoFile<<Atoms[atom].p.x-V1.x<<",\t"<<Atoms[atom].p.z-V1.z<<",\t"<<Atoms[atom].p.y-V1.y<<",\t";
+			demoFile<<Atoms[atom].p.x-V2.x<<",\t"<<Atoms[atom].p.z-V2.z<<",\t"<<Atoms[atom].p.y-V2.y<<", 1e-6,\n";
+			demoFile<<"4,\t";
+			demoFile<<Atoms[atom].p.x<<",\t"<<Atoms[atom].p.z<<",\t"<<Atoms[atom].p.y<<",\t";
+			demoFile<<Atoms[atom].p.x-V2.x<<",\t"<<Atoms[atom].p.z-V2.z<<",\t"<<Atoms[atom].p.y-V2.y<<", 1e-6,\n";
+			demoFile<<"4,\t";
+			demoFile<<Atoms[atom].p.x<<",\t"<<Atoms[atom].p.z<<",\t"<<Atoms[atom].p.y<<",\t";
+			demoFile<<Atoms[atom].p.x-V1.x<<",\t"<<Atoms[atom].p.z-V1.z<<",\t"<<Atoms[atom].p.y-V1.y<<", 1e-6,\n";
+		}
+		for(auto delFace: Atoms[atom].DelaunayTessellations)
+		{
+			auto v1 = delFace.second.first->circumCenter;
+			auto v2 = delFace.second.second->circumCenter;
+			vect V1 = vectDiff(&Atoms[atom].p,&v1);
+			vect V2 = vectDiff(&Atoms[atom].p,&v2);
+			demoFile<<"2,\t";
+			demoFile<<Atoms[atom].p.x-V1.x<<",\t"<<Atoms[atom].p.z-V1.z<<",\t"<<Atoms[atom].p.y-V1.y<<",\t";
+			demoFile<<Atoms[atom].p.x-V2.x<<",\t"<<Atoms[atom].p.z-V2.z<<",\t"<<Atoms[atom].p.y-V2.y<<", 1e-6,\n";
+
+			voroInfoOutputFile<<"draw line \t{";
+			voroInfoOutputFile<<Atoms[atom].p.x-V1.x<<"\t"<<Atoms[atom].p.z-V1.z<<"\t"<<Atoms[atom].p.y-V1.y<<"}\t{";
+			voroInfoOutputFile<<Atoms[atom].p.x-V2.x<<"\t"<<Atoms[atom].p.z-V2.z<<"\t"<<Atoms[atom].p.y-V2.y<<"} width 4\n";
+		}
+	}
+	// Trim away Delaunay tetrahedra on the convex hull whose Voronoi vertex
+	// (circumcenter) is not actually contained within the tetrahedron; this
+	// iteratively peels the hull until only genuine void-space vertices
+	// remain.
+	std::vector<delunay *> voidDelToAnalyze =  fullSet.tetrahedrons;
+	bool vertexDeleted=true;
+	while(vertexDeleted)
+	{
+		vertexDeleted=false;
+		for(auto D : voidDelToAnalyze)
+		{
+			if(D->hull and D->v->is_void)
 			{
-				temp->dangling=1;
-				//std::cout<<"draw color red\n";
-				//std::cout<<"draw sphere {"<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"} radius "<<1e-6<<" resolution 10\n";
-			}
-			else
-			{
-				;//std::cout<<"draw color blue\n";
-				//std::cout<<"draw sphere {"<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"} radius 0.005 \t"<<"resolution 10\n";
-			}
-			if(temp->v_neigh_count!=4 && temp->dangling==0)
-			{
-				for(int i=0;i<temp->v_neigh_count;i++)
+				if(!inside_delunay(D->v,D,Atoms,nAtoms))
 				{
-					cout<<"draw line\t{";
-					cout<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"}\t{";//radius 0.05\t resolution 10\n";
-					cout<<temp->neib_vert[i]->p->x<<"\t"<<temp->neib_vert[i]->p->y<<"\t"<<temp->neib_vert[i]->p->z<<"}\n";// radius 0.05\t resolution 10\n";
-				}
-				//std::cout<<"draw color red\n";
-				//std::cout<<"draw sphere {"<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"} radius 1e-6 \t"<<"resolution 10\n";
-				cout<<"error\n";
-			}
-			if(temp->next)
-			{
-				temp=temp->next;
-			}
-			else
-				break;
-		}
-		int flag=1;
-		int color=0;
-
-		while(flag)
-		{	
-			temp=V->initial;	
-			flag=0;
-			color++;
-			while(temp)
-			{
-				if(temp->dangling && temp->is_void)
-				{
-					if(!inside_delunay(temp,temp->D,Atoms,nAtoms))
+					for(auto neigh:D->neighDel)
 					{
-						flag=1;
-						for(int i=0;i<temp->v_neigh_count;i++)
-						{
-							if(temp->neib_ed[i])
-							{
-								temp->neib_vert[i]->dangling=1;
-							}
-						}	
-						V->delete_vertice(temp);
+						neigh.second->hull=1;
+						neigh.second->delNeighbor(D);
 					}
-				}	
-				temp=temp->next;
+					voidDelToAnalyze.erase(std::remove(voidDelToAnalyze.begin(), voidDelToAnalyze.end(), D), voidDelToAnalyze.end());
+					vertexDeleted=true;
+				}
 			}
 		}
-		//return 0;
-		temp=V->initial;	
-		while(1)
+	}
+	int voidVertCount=0;
+	std::ofstream voroVertexOutputFile(outPrefix + "voidVoronoiVertices.txt");
+	for(auto D : voidDelToAnalyze)
+	{
+		if(D->neighDel.size() != 4 and !D->hull)
+			std::cout<<"error\n";
+		if(D->v->is_void)
 		{
-			if(temp->v_neigh_count!=4 && temp->dangling==0)
-			{
-				//cout<<"error\n";
-				//for(int i=0;i<temp->v_neigh_count;i++)
-				//{
-				//	cout<<"draw line\t{";
-				//	cout<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"}\t{";//radius 0.05\t resolution 10\n";
-				//	cout<<temp->neib_vert[i]->p->x<<"\t"<<temp->neib_vert[i]->p->y<<"\t"<<temp->neib_vert[i]->p->z<<"}\n";// radius 0.05\t resolution 10\n";
-				//}
-			}
-			if(temp->next)
-			{
-				temp=temp->next;
-			}
-			else
-				break;
+			voroVertexOutputFile<<"draw sphere\t{"<<D->circumCenter.x<<"\t"<<D->circumCenter.y<<"\t"<<D->circumCenter.z<<"}\tradius 1e-6\tresolution 10\n";
+			voidVertCount++;
 		}
-		temp=V->initial;
-		void_vert_count=0;
-		std::ofstream voidVertexDisplayFile("voidVertexDisplay.txt");
-		std::ofstream voidVertexDataFile("voidVertexData.txt");
-		voidVertexDisplayFile<<"draw color 8\n";
-		while(1)
+	}
+	delunay **cavity_list=nullptr;
+	cavity_list = new (nothrow) delunay*[voidVertCount];
+	int i=0;
+	for(auto D : voidDelToAnalyze)
+	{
+		if(D->v->is_void)
 		{
-			if(temp->is_void==1)
-			{
-				temp->cluster_index=void_vert_count;
-				void_vert_count=void_vert_count+1;
-				voidVertexDisplayFile<<"draw sphere\t{";
-				voidVertexDisplayFile<<temp->p->x<<"\t"<<temp->p->y<<"\t"<<temp->p->z<<"}\tradius\t"<<temp->ball_r<<"\t"<<"resolution\t10\n";
-				voidVertexDataFile<<temp->ball_r<<"\n";
-			}
-
-			if(temp->next)
-			{
-				temp=temp->next;
-			}
-			else
-				break;
+			cavity_list[i]=D;
+			D->clusterIndex=i;
+			i++;
 		}
-		vertice **cavity_list=nullptr;
-		cavity_list = new (nothrow) vertice*[void_vert_count];
-		int *pocket;
-		pocket = new (nothrow) int[void_vert_count];
-		vertice *temp_start;
-		temp_start=V->initial;
-		int i=0;
-		while(1)
+	}
+	int change=1;
+	int *old_label;
+	old_label=new (nothrow) int[voidVertCount];
+	int min;
+	while(change)
+	{
+		for(int i=0; i<voidVertCount; i++)
 		{
-			if(temp_start->is_void)
-			{
-				cavity_list[i]=temp_start;
-				pocket[i]=0;
-				i++;
-			}
-			if(temp_start->next)
-				temp_start=temp_start->next;
-			else
-				break;
+			old_label[i]=cavity_list[i]->clusterIndex;
 		}
-
-		int change=1;
-		int *old_label;
-		old_label=new (nothrow) int[void_vert_count];
-		int min;
-		while(change)
+		for(int i=0; i<voidVertCount; i++)
 		{
-			for(int i=0; i<void_vert_count; i++)
+			min=cavity_list[i]->clusterIndex;
+			for(auto neighB : cavity_list[i]->neighDel)
 			{
-				old_label[i]=cavity_list[i]->cluster_index;
-			}
-			for(int i=0; i<void_vert_count; i++)
-			{
-				min=cavity_list[i]->cluster_index;
-				for(int n=0; n<cavity_list[i]->v_neigh_count; n++)
+				if(neighB.second->clusterIndex!=-1 && cavity_list[i]->isVoid[neighB.first])
 				{
-					if(cavity_list[i]->neib_vert[n]->cluster_index != -1 && cavity_list[i]->neib_ed[n])
+					if(min > neighB.second->clusterIndex)
 					{
-						//if(!(cavity_list[i]->dangling && cavity_list[i]->neib_vert[n]->dangling))
+						min = neighB.second->clusterIndex;
+					}
+				}
+			}
+			for(auto neighB : cavity_list[i]->neighDel)
+			{
+				if(neighB.second->clusterIndex!=-1 && cavity_list[i]->isVoid[neighB.first])
+				{
+					neighB.second->clusterIndex=min;
+				}
+			}
+		}
+		change=0;
+		int flag=0;
+		for(int i=0; i<voidVertCount; i++)
+		{
+			flag=(old_label[i]!=cavity_list[i]->clusterIndex);
+			if(flag)
+			{
+				change=1;
+				break;
+			}
+		}
+	}
+	delete[] old_label;
+	ofstream cav;
+	cav.open(outPrefix + "cav"+std::to_string(r_cut)+".dat");
+	ofstream cavitiesPOVRAY;
+	cavitiesPOVRAY.open(outPrefix + "cavities"+std::to_string(r_cut)+".dat");
+	cavitiesPOVRAY<<std::setprecision(16);
+	for(int i=0; i<voidVertCount; i++)
+	{
+		int color=1;
+		cav<<"#"<<i<<"\n\n";
+		{
+			for(int j=0; j<voidVertCount; j++)
+			{
+				if(cavity_list[j]->clusterIndex==i)
+				{
+					if(color)
+					{
+						cav<<"draw color "<<(i+1)%16<<"\n";;
+						color=0;
+					}
+					cav<<"draw sphere\t{";
+					cav<<cavity_list[j]->circumCenter.x<<"\t"<<cavity_list[j]->circumCenter.y<<"\t"<<cavity_list[j]->circumCenter.z<<"}\tradius\t"<<1e-3<<"\t"<<"resolution\t10\n";
+					cavitiesPOVRAY<<"1,\t"<<cavity_list[j]->circumCenter.x<<",\t"<<cavity_list[j]->circumCenter.y<<",\t"<<cavity_list[j]->circumCenter.z<<",\n";
+					for(auto neighB:cavity_list[j]->neighDel)
+					{
+						if(cavity_list[j]->isVoid[neighB.first] and neighB.second->v->is_void)
 						{
-							if(min>cavity_list[i]->neib_vert[n]->cluster_index)
-								min=cavity_list[i]->neib_vert[n]->cluster_index;
+							vect v12 = vectDiff(&cavity_list[j]->circumCenter,&neighB.second->circumCenter);
+							cav<<"draw line { ";
+							cav<<cavity_list[j]->circumCenter.x<<"\t"<<cavity_list[j]->circumCenter.y<<"\t"<<cavity_list[j]->circumCenter.z<<"}\t{";
+							cav<<cavity_list[j]->circumCenter.x-v12.x<<"\t"<<cavity_list[j]->circumCenter.y-v12.y<<"\t"<<cavity_list[j]->circumCenter.z-v12.z<<"}\twidth 4\n";
+							cavitiesPOVRAY<<"2,\t";
+							cavitiesPOVRAY<<cavity_list[j]->circumCenter.x<<",\t"<<cavity_list[j]->circumCenter.y<<",\t"<<cavity_list[j]->circumCenter.z<<",\t";
+							cavitiesPOVRAY<<cavity_list[j]->circumCenter.x-v12.x<<",\t"<<cavity_list[j]->circumCenter.y-v12.y<<",\t"<<cavity_list[j]->circumCenter.z-v12.z<<",\n";
 						}
 					}
-					else
-					{
-					}
-
-				}
-				for(int n=0; n<cavity_list[i]->v_neigh_count; n++)
-				{
-					if(cavity_list[i]->neib_vert[n]->cluster_index != -1 && cavity_list[i]->neib_ed[n])
-						cavity_list[i]->neib_vert[n]->cluster_index=min;
-				}
-
-			}
-			change=0;
-			int flag=0;
-			for(int i=0; i<void_vert_count; i++)
-			{
-				flag=(old_label[i]!=cavity_list[i]->cluster_index);
-				if(flag)
-				{
-					change=1;
-					break;
-				}
-			}
-
-		}
-		delete[] old_label;
-		ofstream cav;
-		cav.open("cav");
-		for(int i=0; i<void_vert_count; i++)
-		{
-			for(int j=0; j<void_vert_count; j++)
-			{
-				if(cavity_list[j]->cluster_index==i)
-				{
-					if(cavity_list[j]->dangling)
-					{
-						pocket[i]=1;
-					}
 				}
 			}
 		}
-		for(int i=0; i<void_vert_count; i++)
+	}
+	std::cout<<voidVertCount<<" number of vertices in void\n";
+	long double *cav_vol = new (nothrow) long double[voidVertCount];
+	long double *cav_area = new (nothrow) long double[voidVertCount];
+	if(!cav_vol || !cav_area)
+	{
+		std::cerr<<"Error: failed to allocate memory for "<<voidVertCount<<" void vertices.\n";
+		delete [] Atoms;
+		return EXIT_FAILURE;
+	}
+	for(int i=0; i<voidVertCount; i++)
+	{
+		cav_vol[i]=0;
+		cav_area[i]=0;
+		for(int j=0; j<voidVertCount; j++)
 		{
-			color=1;
-			cav<<"#"<<i<<"\n\n";
+			if(cavity_list[j]->clusterIndex==i)
 			{
-				for(int j=0; j<void_vert_count; j++)
-				{
-					if(cavity_list[j]->cluster_index==i)
-					{
-						if(color)
-						{
-							cav<<"draw color "<<(i+1)%16<<"\n";;
-							color=0;
-						}
-						cav<<"draw sphere\t{";
-						cav<<cavity_list[j]->p->x<<"\t"<<cavity_list[j]->p->y<<"\t"<<cavity_list[j]->p->z<<"}\tradius\t"<<1e-6<<"\t"<<"resolution\t10\n";
-					}
-				}
-			}
-		}
-		//cout<<max_conti<<"\n";
-		std::cout<<void_vert_count<<" number of vertices in void\n";
-		long double *cav_vol;
-		cav_vol= new (nothrow) long double[void_vert_count];
-		long double *cav_area;
-		cav_area= new (nothrow) long double[void_vert_count];
-		for(int i=0; i<void_vert_count; i++)
-		{
-			cav_vol[i]=0;
-			cav_area[i]=0;
-			for(int j=0; j<void_vert_count; j++)
-			{
-				if(cavity_list[j]->cluster_index==i)
-				{
-					vect A1,A2,A3,A4;
-					long double E1x,E1y,E1z;
-					long double r1,r2,r3,r4;
-					int S123,S124,S234,S134;
-					int A1A2E123,A1A3E123,A2A3E123;
-					int A1A2E124,A1A4E124,A2A4E124;
-					int A1A3E134,A1A4E134,A3A4E134;
-					int A2A3E234,A2A4E234,A3A4E234;
-					// long double Vx,Vy,Vz;
-					long double Vx=cavity_list[j]->p->x;
-					long double Vy=cavity_list[j]->p->y;
-					long double Vz=cavity_list[j]->p->z;
-
-					A1=Atoms[cavity_list[j]->D->AT[0]].p;
-					A2=Atoms[cavity_list[j]->D->AT[1]].p;
-					A3=Atoms[cavity_list[j]->D->AT[2]].p;
-					A4=Atoms[cavity_list[j]->D->AT[3]].p;
-
-					r1=Atoms[cavity_list[j]->D->AT[0]].radius;//-r_cut;
-					r2=Atoms[cavity_list[j]->D->AT[1]].radius;//-r_cut;
-					r3=Atoms[cavity_list[j]->D->AT[2]].radius;//-r_cut;
-					r4=Atoms[cavity_list[j]->D->AT[3]].radius;//-r_cut;
-					vect E123,E124,E134,E234;
-					vect B12,B13,B14,B23,B34,B24;
-					long double MIDP234x,MIDP234y,MIDP234z;
-					vect a1,a2,a3,a4;
-					long double X,Y,Z;
-
-					S123=sign_aaav(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,Vx,Vy,Vz);
-					S124=sign_aaav(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A4.x,A4.y,A4.z,A3.x,A3.y,A3.z,Vx,Vy,Vz);
-					S234=sign_aaav(A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,A1.x,A1.y,A1.z,Vx,Vy,Vz);
-					S134=sign_aaav(A1.x,A1.y,A1.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,A2.x,A2.y,A2.z,Vx,Vy,Vz);
-
-					E123=cavity_list[j]->D->MID[0][1][2];
-					E124=cavity_list[j]->D->MID[0][1][3];
-					E134=cavity_list[j]->D->MID[0][2][3];
-					E234=cavity_list[j]->D->MID[1][2][3];
-
-					B12=cavity_list[j]->D->MIDP[0][1];
-					B13=cavity_list[j]->D->MIDP[0][2];
-					B14=cavity_list[j]->D->MIDP[0][3];
-					B23=cavity_list[j]->D->MIDP[1][2];
-					B24=cavity_list[j]->D->MIDP[1][3];
-					B34=cavity_list[j]->D->MIDP[2][3];
-
-
-					A1A2E123=sign_aaae(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,E123.x,E123.y,E123.z);
-					A1A3E123=sign_aaae(A1.x,A1.y,A1.z,A3.x,A3.y,A3.z,A2.x,A2.y,A2.z,E123.x,E123.y,E123.z);
-					A2A3E123=sign_aaae(A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,A1.x,A1.y,A1.z,E123.x,E123.y,E123.z);
-
-					A1A2E124=sign_aaae(A1.x,A1.y,A1.z,A2.x,A2.y,A2.z,A4.x,A4.y,A4.z,E124.x,E124.y,E124.z);
-					A1A4E124=sign_aaae(A1.x,A1.y,A1.z,A4.x,A4.y,A4.z,A2.x,A2.y,A2.z,E124.x,E124.y,E124.z);
-					A2A4E124=sign_aaae(A2.x,A2.y,A2.z,A4.x,A4.y,A4.z,A1.x,A1.y,A1.z,E124.x,E124.y,E124.z);
-
-					A1A3E134=sign_aaae(A1.x,A1.y,A1.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,E134.x,E134.y,E134.z);
-					A1A4E134=sign_aaae(A1.x,A1.y,A1.z,A4.x,A4.y,A4.z,A3.x,A3.y,A3.z,E134.x,E134.y,E134.z);
-					A3A4E134=sign_aaae(A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,A1.x,A1.y,A1.z,E134.x,E134.y,E134.z);
-
-					A2A3E234=sign_aaae(A2.x,A2.y,A2.z,A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,E234.x,E234.y,E234.z);
-					A2A4E234=sign_aaae(A2.x,A2.y,A2.z,A4.x,A4.y,A4.z,A3.x,A3.y,A3.z,E234.x,E234.y,E234.z);
-					A3A4E234=sign_aaae(A3.x,A3.y,A3.z,A4.x,A4.y,A4.z,A2.x,A2.y,A2.z,E234.x,E234.y,E234.z);
-
-					cav_vol[i]=cav_vol[i]+S123*A1A2E123*volume_tetrahedron(A1.x,A1.y,A1.z,E123.x,E123.y,E123.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S123*A1A3E123*volume_tetrahedron(A1.x,A1.y,A1.z,E123.x,E123.y,E123.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S123*A1A2E123*volume_tetrahedron(A2.x,A2.y,A2.z,E123.x,E123.y,E123.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S123*A2A3E123*volume_tetrahedron(A2.x,A2.y,A2.z,E123.x,E123.y,E123.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S123*A1A3E123*volume_tetrahedron(A3.x,A3.y,A3.z,E123.x,E123.y,E123.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r3);
-					cav_vol[i]=cav_vol[i]+S123*A2A3E123*volume_tetrahedron(A3.x,A3.y,A3.z,E123.x,E123.y,E123.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r3);
-
-					cav_vol[i]=cav_vol[i]+S124*A1A2E124*volume_tetrahedron(A1.x,A1.y,A1.z,E124.x,E124.y,E124.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S124*A1A4E124*volume_tetrahedron(A1.x,A1.y,A1.z,E124.x,E124.y,E124.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S124*A1A2E124*volume_tetrahedron(A2.x,A2.y,A2.z,E124.x,E124.y,E124.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S124*A2A4E124*volume_tetrahedron(A2.x,A2.y,A2.z,E124.x,E124.y,E124.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S124*A1A4E124*volume_tetrahedron(A4.x,A4.y,A4.z,E124.x,E124.y,E124.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r4);
-					cav_vol[i]=cav_vol[i]+S124*A2A4E124*volume_tetrahedron(A4.x,A4.y,A4.z,E124.x,E124.y,E124.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r4);
-
-					cav_vol[i]=cav_vol[i]+S134*A1A3E134*volume_tetrahedron(A1.x,A1.y,A1.z,E134.x,E134.y,E134.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S134*A1A4E134*volume_tetrahedron(A1.x,A1.y,A1.z,E134.x,E134.y,E134.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r1);
-					cav_vol[i]=cav_vol[i]+S134*A1A3E134*volume_tetrahedron(A3.x,A3.y,A3.z,E134.x,E134.y,E134.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r3);
-					cav_vol[i]=cav_vol[i]+S134*A3A4E134*volume_tetrahedron(A3.x,A3.y,A3.z,E134.x,E134.y,E134.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r3);
-					cav_vol[i]=cav_vol[i]+S134*A1A4E134*volume_tetrahedron(A4.x,A4.y,A4.z,E134.x,E134.y,E134.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r4);
-					cav_vol[i]=cav_vol[i]+S134*A3A4E134*volume_tetrahedron(A4.x,A4.y,A4.z,E134.x,E134.y,E134.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r4);
-
-					cav_vol[i]=cav_vol[i]+S234*A2A3E234*volume_tetrahedron(A2.x,A2.y,A2.z,E234.x,E234.y,E234.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S234*A2A4E234*volume_tetrahedron(A2.x,A2.y,A2.z,E234.x,E234.y,E234.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r2);
-					cav_vol[i]=cav_vol[i]+S234*A2A3E234*volume_tetrahedron(A3.x,A3.y,A3.z,E234.x,E234.y,E234.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r3);
-					cav_vol[i]=cav_vol[i]+S234*A3A4E234*volume_tetrahedron(A3.x,A3.y,A3.z,E234.x,E234.y,E234.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r3);
-					cav_vol[i]=cav_vol[i]+S234*A2A4E234*volume_tetrahedron(A4.x,A4.y,A4.z,E234.x,E234.y,E234.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r4);
-					cav_vol[i]=cav_vol[i]+S234*A3A4E234*volume_tetrahedron(A4.x,A4.y,A4.z,E234.x,E234.y,E234.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r4);
-
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S123*A1A2E123*volume_tetrahedron(A1.x,A1.y,A1.z,E123.x,E123.y,E123.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r1,1);
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S123*A1A3E123*volume_tetrahedron(A1.x,A1.y,A1.z,E123.x,E123.y,E123.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r1,1);
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S124*A1A2E124*volume_tetrahedron(A1.x,A1.y,A1.z,E124.x,E124.y,E124.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r1,1);
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S124*A1A4E124*volume_tetrahedron(A1.x,A1.y,A1.z,E124.x,E124.y,E124.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r1,1);
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S134*A1A3E134*volume_tetrahedron(A1.x,A1.y,A1.z,E134.x,E134.y,E134.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r1,1);
-					Atoms[cavity_list[j]->D->AT[0]].vor_vol=Atoms[cavity_list[j]->D->AT[0]].vor_vol+S134*A1A4E134*volume_tetrahedron(A1.x,A1.y,A1.z,E134.x,E134.y,E134.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r1,1);
-
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S123*A1A2E123*volume_tetrahedron(A2.x,A2.y,A2.z,E123.x,E123.y,E123.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r2,1);						
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S123*A2A3E123*volume_tetrahedron(A2.x,A2.y,A2.z,E123.x,E123.y,E123.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r2,1);
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S124*A1A2E124*volume_tetrahedron(A2.x,A2.y,A2.z,E124.x,E124.y,E124.z,B12.x,B12.y,B12.z,Vx,Vy,Vz,r2,1);
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S124*A2A4E124*volume_tetrahedron(A2.x,A2.y,A2.z,E124.x,E124.y,E124.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r2,1);
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S234*A2A3E234*volume_tetrahedron(A2.x,A2.y,A2.z,E234.x,E234.y,E234.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r2,1);
-					Atoms[cavity_list[j]->D->AT[1]].vor_vol=Atoms[cavity_list[j]->D->AT[1]].vor_vol+S234*A2A4E234*volume_tetrahedron(A2.x,A2.y,A2.z,E234.x,E234.y,E234.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r2,1);
-
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S123*A1A3E123*volume_tetrahedron(A3.x,A3.y,A3.z,E123.x,E123.y,E123.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r3,1);
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S123*A2A3E123*volume_tetrahedron(A3.x,A3.y,A3.z,E123.x,E123.y,E123.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r3,1);
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S134*A1A3E134*volume_tetrahedron(A3.x,A3.y,A3.z,E134.x,E134.y,E134.z,B13.x,B13.y,B13.z,Vx,Vy,Vz,r3,1);
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S134*A3A4E134*volume_tetrahedron(A3.x,A3.y,A3.z,E134.x,E134.y,E134.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r3,1);
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S234*A2A3E234*volume_tetrahedron(A3.x,A3.y,A3.z,E234.x,E234.y,E234.z,B23.x,B23.y,B23.z,Vx,Vy,Vz,r3,1);
-					Atoms[cavity_list[j]->D->AT[2]].vor_vol=Atoms[cavity_list[j]->D->AT[2]].vor_vol+S234*A3A4E234*volume_tetrahedron(A3.x,A3.y,A3.z,E234.x,E234.y,E234.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r3,1);
-
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S124*A1A4E124*volume_tetrahedron(A4.x,A4.y,A4.z,E124.x,E124.y,E124.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r4,1);
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S124*A2A4E124*volume_tetrahedron(A4.x,A4.y,A4.z,E124.x,E124.y,E124.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r4,1);
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S134*A1A4E134*volume_tetrahedron(A4.x,A4.y,A4.z,E134.x,E134.y,E134.z,B14.x,B14.y,B14.z,Vx,Vy,Vz,r4,1);
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S134*A3A4E134*volume_tetrahedron(A4.x,A4.y,A4.z,E134.x,E134.y,E134.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r4,1);
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S234*A2A4E234*volume_tetrahedron(A4.x,A4.y,A4.z,E234.x,E234.y,E234.z,B24.x,B24.y,B24.z,Vx,Vy,Vz,r4,1);
-					Atoms[cavity_list[j]->D->AT[3]].vor_vol=Atoms[cavity_list[j]->D->AT[3]].vor_vol+S234*A3A4E234*volume_tetrahedron(A4.x,A4.y,A4.z,E234.x,E234.y,E234.z,B34.x,B34.y,B34.z,Vx,Vy,Vz,r4,1);
-
-
-
+				cav_vol[i]=cav_vol[i]+void_vol(cavity_list[j]->v,Atoms);
 			}
 		}
 	}
 	long double cav_tot=0.;
 	long double ca_per_tot=0.;
-	std::ofstream cavityVolumeOutput("cavityVolume.txt");
-	for(int i=0; i<void_vert_count; i++)
+	// cluster_index <TAB> void_volume for every non-empty cavity/pocket.
+	std::ofstream cavityVolumeOutput(outPrefix + "cavityVolume.txt");
+	for(int i=0; i<voidVertCount; i++)
 	{
 		if(cav_vol[i])
-			cavityVolumeOutput<<i<<"\t"<<cav_vol[i]<<"\n";//<<resno<<"\t"<<pocket[i]<<"\n";
+			cavityVolumeOutput<<i<<"\t"<<cav_vol[i]<<"\n";
 		cav_tot=cav_tot+cav_vol[i];
 		ca_per_tot=ca_per_tot+cav_area[i];
-		//cout<<i<<"\t"<<cav_area[i]<<"\t"<<cav_lenght[i]<<"\n";
 	}
-	std::string filename = "r_cut_vs_pore_vol.txt";
 	std::cout<<cav_tot<<"\t"<<cav_tot/(boxx*boxy*boxz)<<"\n";
-	// 1. Create an std::ofstream object (output file stream)
-	// 2. Open the file in append mode (std::ios::app)
-	std::ofstream outfile(filename, std::ios::app);
-	cout<<std::setprecision(16);
-	cout<<r_cut<<"\t"<<volumeBox<<"\t"<<volumeAtoms+cav_tot<<"\t"<<cav_tot<<"\n";
-	outfile<<r_cut<<"\t"<<cav_tot<<"\n";
-	//cout<<r_cut<<"\t"<<cav_tot<<"\t"<<ca_per_tot<<"\n";
-	delete [] pocket;
+
+	// Appended (not overwritten) so this file can accumulate a
+	// probe-radius-vs-void-volume curve across multiple runs with
+	// different probe_radius values on the same packing.
+	std::ofstream outfile(outPrefix + "r_cut_vs_pore_vol.txt", std::ios::app);
+	outfile<<std::setprecision(16)<<r_cut<<"\t"<<cav_tot<<"\n";
+
+	std::cout<<std::setprecision(16);
+	std::cout<<"probe_radius\tbox_volume\tatoms_volume+void_volume\tvoid_volume\n";
+	std::cout<<r_cut<<"\t"<<volumeBox<<"\t"<<volumeAtoms+cav_tot<<"\t"<<cav_tot<<"\n";
+
 	delete [] cav_vol;
 	delete [] cav_area;
 	delete [] cavity_list;
-	return 0;
-	}
-
-	//for(int t=0; t<ntypes; t++)
-	{
-		container_vertice *cstart=nullptr;
-		vertice *temp_start=nullptr;
-		temp_start=V->initial;
-		while(1)
-		{
-			vertice *temp=nullptr;
-			temp=temp_start;
-			if(temp_start->next)
-			{
-				temp_start=temp_start->next;
-				delete temp->p;
-				delete temp;
-			}
-			else
-			{
-				delete temp->p;
-				delete temp;
-				break;
-			}
-
-		}
-	}
-	delete [] start;
-	delunay *D;
-	delunay *temp;
-	//for(int t=0; t<ntypes; t++)
-	{
-		temp=FULLSETD.initial;
-		while(1)
-		{
-			D=temp;
-			if(temp->next)
-			{
-				temp=temp->next;
-				delete D;
-			}
-			else
-			{
-				delete D;
-				break;
-			}
-		}
-		FULLSETD.initial=nullptr;
-		FULLSETD.end=nullptr;
-	}
-	for(int n=0; n<nAtoms; n++)
-	{
-		//delete[] Atoms[n].Cstart;
-		container_delunay *D=nullptr;
-		//for(int t=0; t<ntypes; t++)
-		{
-			D=Atoms[n].D_FIRST;
-			while(1)
-			{
-				container_delunay *temp=nullptr;
-				temp=D;
-				if(D->next)
-				{
-					D=D->next;
-					delete temp;
-				}
-				else
-				{
-					delete temp;
-					break;
-				}
-			}
-		}
-	}
-	delete[] Atoms;
-	delete[] radius;
+	delete [] Atoms;
+	return EXIT_SUCCESS;
 }
-//delete_everything(Atoms,nAtoms,ntypes);
